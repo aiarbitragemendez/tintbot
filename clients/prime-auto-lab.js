@@ -8,7 +8,7 @@ const client = {
   shopHours: "Monday-Saturday, 9am-6pm",
 
   ghlApiKey: process.env.GHL_API_KEY_PRIME_AUTO_LAB,
-  ghlLocationId: "PASTE_YOUR_LOCATION_ID_HERE",
+  ghlLocationId: "11y3Q10E1oPAk5deBJvA",
   ghlCalendarId: "PASTE_YOUR_CALENDAR_ID_HERE",
   ghlPipelineId: "PASTE_YOUR_PIPELINE_ID_HERE",
   ghlPipelineStageId: "PASTE_YOUR_STAGE_ID_HERE",
