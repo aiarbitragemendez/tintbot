@@ -67,12 +67,12 @@ app.post("/ghl-webhook", async (req, res) => {
   console.log("GHL WEBHOOK RECEIVED:", JSON.stringify(body));
   if (body.direction === "outbound") return;
 
-  const locationId = body.locationId || body.location_id;
+  const locationId = body.locationId || body.location_id || (body.location && body.location.id);
   const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
   if (!client) return;
 
-  const inboundText = body.message || body.body || body.text || "";
   const contactId = body.contactId || body.contact_id;
+  const inboundText = (body.message && body.message.body) || body.message || body.body || body.text || "";
   if (!inboundText || !contactId) return;
 
   const session = getSession(contactId, client.clientId);
