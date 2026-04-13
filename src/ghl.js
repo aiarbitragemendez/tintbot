@@ -74,9 +74,15 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
 }
 
 async function sendMessage(apiKey, contactId, message, type = "SMS") {
-  const res = await axios.post(`${GHL_BASE}/conversations/messages`, {
+  const res = await axios.post(`https://services.leadconnectorhq.com/conversations/messages`, {
     type, contactId, message,
-  }, { headers: ghlHeaders(apiKey) });
+  }, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Version: "2021-04-15",
+    }
+  });
   return res.data;
 }
 
