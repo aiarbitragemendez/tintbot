@@ -64,6 +64,7 @@ app.post("/chat", async (req, res) => {
 app.post("/ghl-webhook", async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
+  console.log("GHL WEBHOOK RECEIVED:", JSON.stringify(body));
   if (body.direction === "outbound") return;
 
   const locationId = body.locationId || body.location_id;
