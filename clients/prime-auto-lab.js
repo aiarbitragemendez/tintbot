@@ -1,7 +1,7 @@
 const client = {
   clientId: "prime-auto-lab",
   shopName: "Prime Auto Lab",
-  botName: "Alex",
+  botName: "Sofia",
   city: "Kendall, Miami",
   address: "14032 SW 140th St Bay 16, Miami, FL 33186",
   phone: "(305) 555-0000",
@@ -14,17 +14,19 @@ const client = {
   ghlPipelineStageId: "PASTE_YOUR_STAGE_ID_HERE",
 
   pricingGuide: `
-Standard Ceramic Film (40% heat rejection, 3-5 year warranty):
-- Sedan front 2 windows: $120-$150
-- Sedan full car: $250-$300
-- SUV/Truck full: $300-$380
-- Windshield ceramic clear: $180-$220
+Standard Ceramic Film pricing (what we offer by default):
+- Front two windows only: $120-$150
+- Sides and rear (full car without windshield): $249
+- Full front windshield: additional $120-$150
+- Sunroof or panoramic roof: additional $50-$100
+- Sun strip (windshield top strip): additional $40-$60
+- Tint removal: additional $50-$100 depending on condition of existing tint
 
-Nano-Ceramic Film (98% heat rejection, 7-10 year warranty):
-- Sedan front 2 windows: $200-$250
-- Sedan full car: $400-$480
-- SUV/Truck full: $480-$580
-- Windshield nano-ceramic clear: $280-$340
+We offer tint darkness from 5% all the way to 70% — customer can choose their preference.
+
+If customer asks about better film or nano-ceramic: just say it is available as an upgrade for $50-$150 more depending on the package. Do not bring it up unless they ask.
+
+Shop hours: Monday to Saturday, 10am to 6pm. Appointments only.
 `,
 
   faqText: `
