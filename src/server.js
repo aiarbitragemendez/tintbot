@@ -76,6 +76,9 @@ app.post("/ghl-webhook", async (req, res) => {
   if (!inboundText || !contactId) return;
 
   const session = getSession(contactId, client.clientId);
+  console.log("Contact ID:", contactId);
+  console.log("Message:", inboundText);
+  console.log("Session messages count:", session ? session.messages.length : 0);
   session.messages.push({ role: "user", content: inboundText });
 
   try {
