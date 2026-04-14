@@ -74,15 +74,42 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
 }
 
 async function sendMessage(apiKey, contactId, message, type = "SMS") {
-  const res = await axios.post(`https://services.leadconnectorhq.com/conversations/messages`, {
-    type, contactId, message,
-  }, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      Version: "2021-04-15",
+  const axios = require("axios");
+
+  // First get the conversation ID for this contact
+  const convResponse = await axios.get(
+    `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Version: "2021-04-15",
+      }
     }
-  });
+  );
+
+  const conversations = convResponse.data?.conversations;
+  if (!conversations || conversations.length === 0) {
+    throw new Error("No conversation found for contact");
+  }
+
+  const conversationId = conversations[0].id;
+
+  // Send message to that conversation
+  const res = await axios.post(
+    `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`,
+    {
+      type: "SMS",
+      message,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Version: "2021-04-15",
+      }
+    }
+  );
   return res.data;
 }
 
