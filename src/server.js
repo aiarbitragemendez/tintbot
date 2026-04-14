@@ -193,7 +193,7 @@ Known: ${JSON.stringify(data)}`
     data._appointmentBooked = true;
     console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
     try {
-      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.ghlContactId || session.contactId, {
+      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.ghlContactId || session.contactId, client.ghlLocationId, {
         startTime: data.appointmentTime,
         title: `Tint Appointment — ${data.name || "Customer"}`,
         notes: `Vehicle: ${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,

@@ -37,10 +37,11 @@ async function upsertContact(apiKey, { firstName, lastName, phone, email, tags =
   return res.data.contact;
 }
 
-async function bookAppointment(apiKey, calendarId, contactId, { startTime, endTime, title, notes }) {
+async function bookAppointment(apiKey, calendarId, contactId, locationId, { startTime, endTime, title, notes }) {
   const payload = {
     calendarId,
     contactId,
+    locationId,
     startTime,
     endTime: endTime || addHours(startTime, 2),
     title: title || "Window Tint Appointment",
@@ -50,9 +51,15 @@ async function bookAppointment(apiKey, calendarId, contactId, { startTime, endTi
   if (notes) payload.notes = notes;
 
   const res = await axios.post(
-    `${BASE}/calendars/events/appointments`,
+    `https://services.leadconnectorhq.com/calendars/events/appointments`,
     payload,
-    { headers: v2Headers(apiKey) }
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Version: "2021-04-15",
+      }
+    }
   );
   return res.data;
 }
