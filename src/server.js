@@ -90,6 +90,7 @@ app.post("/ghl-webhook", async (req, res) => {
     });
     const reply = response.content[0].text;
     session.messages.push({ role: "assistant", content: reply });
+    syncData(session, client, inboundText, reply).catch(console.error);
     await ghl.sendMessage(client.ghlApiKey, contactId, reply);
   } catch (err) {
     console.error("Webhook error:", err.message);
@@ -103,6 +104,109 @@ app.post("/ghl-webhook", async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok", clients: Object.keys(clients), timestamp: new Date().toISOString() });
 });
+
+async function syncData(session, client, userMessage, botReply) {
+  const data = session.collectedData;
+
+  const extractionResult = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 300,
+    messages: [{
+      role: "user",
+      content: `Extract customer data from this exchange. Return ONLY valid JSON, no markdown:
+{
+  "name": "full name or null",
+  "phone": "phone or null",
+  "email": "email or null",
+  "vehicleYear": "year or null",
+  "vehicleMake": "brand or null",
+  "vehicleModel": "model or null",
+  "windows": "which windows or null",
+  "tintPackage": "Standard Ceramic or Nano-Ceramic or null",
+  "appointmentTime": "ISO 8601 datetime or null",
+  "isEscalation": false,
+  "isReadyToBook": false
+}
+Today is ${new Date().toISOString()}. Timezone is Miami FL (ET).
+If customer mentions a day and time like "Friday at 10am" convert it to ISO 8601.
+Set isReadyToBook to true if customer has confirmed a specific day and time.
+Customer: "${userMessage}"
+Bot: "${botReply}"
+Known: ${JSON.stringify(data)}`
+    }]
+  });
+
+  let extracted;
+  try {
+    const raw = extractionResult.content[0].text.replace(/```json|```/g, "").trim();
+    extracted = JSON.parse(raw);
+    console.log("EXTRACTED DATA:", JSON.stringify(extracted));
+  } catch {
+    return;
+  }
+
+  Object.keys(extracted).forEach(k => {
+    if (extracted[k] !== null && extracted[k] !== undefined) data[k] = extracted[k];
+  });
+
+  if (!client.ghlApiKey) return;
+
+  if (data.name && data.phone && !session._contactSynced) {
+    session._contactSynced = true;
+    const [firstName, ...rest] = data.name.trim().split(" ");
+    try {
+      await ghl.upsertContact(client.ghlApiKey, {
+        firstName,
+        lastName: rest.join(" ") || "",
+        phone: data.phone,
+        email: data.email || undefined,
+        tags: ["chatbot-lead", "sms-bot"],
+        customFields: {
+          vehicle: `${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}`.trim(),
+          windows: data.windows || "",
+          tintPackage: data.tintPackage || "",
+        }
+      });
+      if (client.ghlPipelineId) {
+        await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, session.contactId);
+      }
+    } catch (e) {
+      console.error("Contact sync error:", e.message);
+    }
+  }
+
+  if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
+    data._appointmentBooked = true;
+    console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
+    try {
+      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.contactId, {
+        startTime: data.appointmentTime,
+        title: `Tint Appointment — ${data.name || "Customer"}`,
+        notes: `Vehicle: ${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,
+      });
+      await ghl.addTag(client.ghlApiKey, session.contactId, ["appointment-booked"]);
+      if (client.ghlConfirmationWorkflowId) {
+        await ghl.triggerWorkflow(client.ghlApiKey, session.contactId, client.ghlConfirmationWorkflowId);
+      }
+    } catch (e) {
+      console.error("Booking error:", e.message);
+    }
+  }
+
+  if (extracted.isEscalation && !session.escalated) {
+    session.escalated = true;
+    try {
+      await ghl.addTag(client.ghlApiKey, session.contactId, ["escalated", "needs-human"]);
+      await ghl.addNote(client.ghlApiKey, session.contactId,
+        `Bot flagged escalation.\nCustomer said: "${userMessage}"`);
+      if (client.ghlEscalationWorkflowId) {
+        await ghl.triggerWorkflow(client.ghlApiKey, session.contactId, client.ghlEscalationWorkflowId);
+      }
+    } catch (e) {
+      console.error("Escalation error:", e.message);
+    }
+  }
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
