@@ -89,9 +89,18 @@ app.post("/ghl-webhook", async (req, res) => {
       messages: session.messages,
     });
     const reply = response.content[0].text;
+    console.log("BOT REPLY:", reply);
     session.messages.push({ role: "assistant", content: reply });
     syncData(session, client, inboundText, reply).catch(console.error);
-    await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId);
+    try {
+      await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId);
+      console.log("MESSAGE SENT SUCCESSFULLY");
+    } catch (sendErr) {
+      console.error("SEND ERROR:", sendErr.message);
+      if (sendErr.response) {
+        console.error("SEND ERROR DETAILS:", JSON.stringify(sendErr.response.data));
+      }
+    }
   } catch (err) {
     console.error("Webhook error:", err.message);
     try {
