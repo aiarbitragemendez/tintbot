@@ -88,6 +88,7 @@ async function sendMessage(apiKey, contactId, message, locationId) {
   let conversationId;
   try {
     const convResponse = await axios.get(searchUrl, { headers: v2Headers });
+    console.log("CONVERSATIONS FOUND:", JSON.stringify(convResponse.data));
     const conversations = convResponse.data?.conversations;
     if (conversations && conversations.length > 0) {
       conversationId = conversations[0].id;
