@@ -204,6 +204,10 @@ Known: ${JSON.stringify(data)}`
       }
     } catch (e) {
       console.error("Booking error:", e.message);
+      if (e.response) {
+        console.error("Booking error details:", JSON.stringify(e.response.data));
+        console.error("Booking error status:", e.response.status);
+      }
     }
   }
 
