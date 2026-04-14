@@ -14,19 +14,24 @@ const client = {
   ghlPipelineStageId: "PASTE_YOUR_STAGE_ID_HERE",
 
   pricingGuide: `
-Standard Ceramic Film pricing (what we offer by default):
+PRICING RULES — FOLLOW EXACTLY:
+
+When a customer says "full car" or "whole car" — quote ONLY sides and rear which is $249. Do not include windshield unless they specifically ask. Say something like "Full car tint (sides and rear) is $249. Want me to get you scheduled?"
+
+Only add windshield price if customer specifically mentions windshield or asks about it separately — it is an additional $120-$150.
+
+Quote each service separately and only when asked:
+- Sides and rear (full car): $249 flat
 - Front two windows only: $120-$150
-- Sides and rear (full car without windshield): $249
-- Full front windshield: additional $120-$150
-- Sunroof or panoramic roof: additional $50-$100
-- Sun strip (windshield top strip): additional $40-$60
-- Tint removal: additional $50-$100 depending on condition of existing tint
+- Full front windshield: $120-$150 additional
+- Sunroof or panoramic: $50-$100 additional
+- Sun strip: $40-$60 additional
+- Tint removal: $50-$100 additional
 
-We offer tint darkness from 5% all the way to 70% — customer can choose their preference.
-
-If customer asks about better film or nano-ceramic: just say it is available as an upgrade for $50-$150 more depending on the package. Do not bring it up unless they ask.
-
-Shop hours: Monday to Saturday, 10am to 6pm. Appointments only.
+Never combine prices unless the customer asks about multiple services in the same message.
+Never give a range like $250-$300 — give the exact price for exactly what they asked.
+If customer asks about nano-ceramic or better film — say it is available for $50-$150 more depending on the package.
+We offer darkness from 5% to 70%.
 `,
 
   faqText: `
