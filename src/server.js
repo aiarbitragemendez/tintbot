@@ -188,6 +188,7 @@ Known: ${JSON.stringify(data)}`
     }
   }
 
+  console.log("BOOKING CHECK - isReadyToBook:", extracted.isReadyToBook, "appointmentTime:", data.appointmentTime, "alreadyBooked:", data._appointmentBooked);
   if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
     data._appointmentBooked = true;
     console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
