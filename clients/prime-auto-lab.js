@@ -9,9 +9,9 @@ const client = {
 
   ghlApiKey: process.env.GHL_API_KEY_PRIME_AUTO_LAB,
   ghlLocationId: "11y3Q10E1oPAk5deBJvA",
-  ghlCalendarId: "PASTE_YOUR_CALENDAR_ID_HERE",
-  ghlPipelineId: "PASTE_YOUR_PIPELINE_ID_HERE",
-  ghlPipelineStageId: "PASTE_YOUR_STAGE_ID_HERE",
+  ghlCalendarId: "YB9W9wH0vAtimvw6L5Fz",
+  ghlPipelineId: "11y3Q10E1oPAk5deBJvA",
+  ghlPipelineStageId: "11y3Q10E1oPAk5deBJvA",
 
   pricingGuide: `
 PRICING RULES — FOLLOW EXACTLY:
