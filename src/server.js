@@ -17,21 +17,24 @@ app.use(express.json());
 
 const sessions = new Map();
 
-function getSession(sessionId, clientId) {
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, {
+function getSession(contactId, clientId) {
+  const key = `${clientId}:${contactId}`;
+  if (!sessions.has(key)) {
+    sessions.set(key, {
       clientId,
+      contactId,
       messages: [],
+      ghlContactId: contactId,
       collectedData: {
         name: null, phone: null, email: null,
         vehicleYear: null, vehicleMake: null, vehicleModel: null,
         windows: null, tintPackage: null, appointmentTime: null,
+        _appointmentBooked: false,
       },
       escalated: false,
-      contactId: null,
     });
   }
-  return sessions.get(sessionId);
+  return sessions.get(key);
 }
 
 app.post("/chat", async (req, res) => {
@@ -71,11 +74,12 @@ app.post("/ghl-webhook", async (req, res) => {
   const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
   if (!client) return;
 
-  const contactId = body.contactId || body.contact_id;
+  const contactId = body.contactId || body.contact_id || null;
   const inboundText = (body.message && body.message.body) || body.message || body.body || body.text || "";
   if (!inboundText || !contactId) return;
 
   const session = getSession(contactId, client.clientId);
+  session.contactId = contactId;
   console.log("Contact ID:", contactId);
   console.log("Message:", inboundText);
   console.log("Session messages count:", session ? session.messages.length : 0);
