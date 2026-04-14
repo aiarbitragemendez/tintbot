@@ -91,12 +91,12 @@ app.post("/ghl-webhook", async (req, res) => {
     const reply = response.content[0].text;
     session.messages.push({ role: "assistant", content: reply });
     syncData(session, client, inboundText, reply).catch(console.error);
-    await ghl.sendMessage(client.ghlApiKey, contactId, reply);
+    await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId);
   } catch (err) {
     console.error("Webhook error:", err.message);
     try {
       await ghl.sendMessage(client.ghlApiKey, contactId,
-        "Sorry, I'm having a quick technical issue! Please call us or try again in a moment.");
+        "Sorry, I'm having a quick technical issue! Please call us or try again in a moment.", client.ghlLocationId);
     } catch (_) {}
   }
 });

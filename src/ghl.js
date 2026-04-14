@@ -73,42 +73,47 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
   return res.data;
 }
 
-async function sendMessage(apiKey, contactId, message, type = "SMS") {
-  const axios = require("axios");
+async function sendMessage(apiKey, contactId, message, locationId) {
+  const v2Headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    Version: "2021-04-15",
+  };
 
-  // First get the conversation ID for this contact
-  const convResponse = await axios.get(
-    `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}`,
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        Version: "2021-04-15",
-      }
+  // Search for existing conversation, including locationId if provided
+  const searchUrl = locationId
+    ? `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}&locationId=${locationId}`
+    : `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}`;
+
+  let conversationId;
+  try {
+    const convResponse = await axios.get(searchUrl, { headers: v2Headers });
+    const conversations = convResponse.data?.conversations;
+    if (conversations && conversations.length > 0) {
+      conversationId = conversations[0].id;
     }
-  );
-
-  const conversations = convResponse.data?.conversations;
-  if (!conversations || conversations.length === 0) {
-    throw new Error("No conversation found for contact");
+  } catch (e) {
+    console.error("Conversation search error:", e.message);
   }
 
-  const conversationId = conversations[0].id;
+  // If no conversation found, create one
+  if (!conversationId) {
+    if (!locationId) throw new Error("No conversation found and no locationId to create one");
+    const createRes = await axios.post(
+      `https://services.leadconnectorhq.com/conversations/`,
+      { contactId, locationId },
+      { headers: v2Headers }
+    );
+    conversationId = createRes.data?.conversation?.id || createRes.data?.id;
+    if (!conversationId) throw new Error("Failed to create conversation");
+    console.log("Created new conversation:", conversationId);
+  }
 
-  // Send message to that conversation
+  // Send message to the conversation
   const res = await axios.post(
     `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`,
-    {
-      type: "SMS",
-      message,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        Version: "2021-04-15",
-      }
-    }
+    { type: "SMS", message },
+    { headers: v2Headers }
   );
   return res.data;
 }
