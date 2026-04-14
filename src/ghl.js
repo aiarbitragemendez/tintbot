@@ -112,8 +112,8 @@ async function sendMessage(apiKey, contactId, message, locationId) {
 
   // Send message to the conversation
   const res = await axios.post(
-    `https://services.leadconnectorhq.com/conversations/${conversationId}/messages`,
-    { type: "SMS", message },
+    `https://services.leadconnectorhq.com/conversations/messages`,
+    { type: "SMS", message, conversationId },
     { headers: v2Headers }
   );
   return res.data;
