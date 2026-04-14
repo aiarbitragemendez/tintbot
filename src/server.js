@@ -68,36 +68,54 @@ app.post("/ghl-webhook", async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
   console.log("GHL WEBHOOK RECEIVED:", JSON.stringify(body));
+
   if (body.direction === "outbound") return;
 
   const locationId = body.locationId || body.location_id || (body.location && body.location.id);
   const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
-  if (!client) return;
+  if (!client) {
+    console.warn("No client found for locationId:", locationId);
+    return;
+  }
 
-  const contactId = body.contactId || body.contact_id || null;
   const inboundText = (body.message && body.message.body) || body.message || body.body || body.text || "";
-  if (!inboundText || !contactId) return;
+  const contactId = body.contactId || body.contact_id || null;
 
-  const session = getSession(contactId, client.clientId);
-  session.contactId = contactId;
+  if (!inboundText || !contactId) {
+    console.warn("Missing message or contactId");
+    return;
+  }
+
   console.log("Contact ID:", contactId);
   console.log("Message:", inboundText);
-  console.log("Session messages count:", session ? session.messages.length : 0);
-  session.messages.push({ role: "user", content: inboundText });
+
+  const session = getSession(contactId, client.clientId);
+  console.log("Session messages count:", session.messages.length);
+
+  // Add user message as clean string
+  session.messages.push({ role: "user", content: String(inboundText) });
+
+  // Keep only last 20 messages and ensure all are clean
+  const recentMessages = session.messages
+    .slice(-20)
+    .filter(m => m && m.role && m.content && typeof m.content === "string" && m.content.trim() !== "");
 
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 400,
       system: buildSystemPrompt(client),
-      messages: session.messages,
+      messages: recentMessages,
     });
+
     const reply = response.content[0].text;
     console.log("BOT REPLY:", reply);
-    session.messages.push({ role: "assistant", content: reply });
-    syncData(session, client, inboundText, reply).catch(console.error);
+
+    // Save clean reply to session
+    session.messages.push({ role: "assistant", content: String(reply) });
+
     try {
-      await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId);
+      await ghl.sendMessage(client.ghlApiKey, contactId, reply);
       console.log("MESSAGE SENT SUCCESSFULLY");
     } catch (sendErr) {
       console.error("SEND ERROR:", sendErr.message);
@@ -105,11 +123,14 @@ app.post("/ghl-webhook", async (req, res) => {
         console.error("SEND ERROR DETAILS:", JSON.stringify(sendErr.response.data));
       }
     }
+
+    syncData(session, client, inboundText, reply).catch(console.error);
+
   } catch (err) {
-    console.error("Webhook error:", err.message);
+    console.error("Webhook error:", err.status, JSON.stringify(err.error || err.message));
     try {
       await ghl.sendMessage(client.ghlApiKey, contactId,
-        "Sorry, I'm having a quick technical issue! Please call us or try again in a moment.", client.ghlLocationId);
+        "Hi! Sofia here from Prime Auto Lab. How can I help you today?");
     } catch (_) {}
   }
 });
