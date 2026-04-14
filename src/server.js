@@ -188,7 +188,7 @@ Known: ${JSON.stringify(data)}`
     }
   }
 
-  console.log("BOOKING CHECK - isReadyToBook:", extracted.isReadyToBook, "appointmentTime:", data.appointmentTime, "alreadyBooked:", data._appointmentBooked);
+  console.log("BOOKING CHECK - isReadyToBook:", extracted.isReadyToBook, "appointmentTime:", data.appointmentTime, "alreadyBooked:", data._appointmentBooked, "ghlContactId:", session.ghlContactId, "contactId:", session.contactId);
   if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
     data._appointmentBooked = true;
     console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
