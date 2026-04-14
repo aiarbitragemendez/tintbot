@@ -160,13 +160,15 @@ Known: ${JSON.stringify(data)}`
 
   if (!client.ghlApiKey) return;
 
-  if (data.name && data.phone && !session._contactSynced) {
+  if (data.phone && !session._contactSynced) {
     session._contactSynced = true;
-    const [firstName, ...rest] = data.name.trim().split(" ");
+    const nameParts = (data.name || "Customer").trim().split(" ");
+    const firstName = nameParts[0];
+    const lastName = nameParts.slice(1).join(" ") || "";
     try {
-      await ghl.upsertContact(client.ghlApiKey, {
+      const contact = await ghl.upsertContact(client.ghlApiKey, {
         firstName,
-        lastName: rest.join(" ") || "",
+        lastName,
         phone: data.phone,
         email: data.email || undefined,
         tags: ["chatbot-lead", "sms-bot"],
@@ -176,8 +178,10 @@ Known: ${JSON.stringify(data)}`
           tintPackage: data.tintPackage || "",
         }
       });
+      session.ghlContactId = contact.id;
+      console.log("CONTACT SYNCED:", contact.id);
       if (client.ghlPipelineId) {
-        await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, session.contactId);
+        await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id);
       }
     } catch (e) {
       console.error("Contact sync error:", e.message);
@@ -188,7 +192,7 @@ Known: ${JSON.stringify(data)}`
     data._appointmentBooked = true;
     console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
     try {
-      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.contactId, {
+      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.ghlContactId || session.contactId, {
         startTime: data.appointmentTime,
         title: `Tint Appointment — ${data.name || "Customer"}`,
         notes: `Vehicle: ${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,
