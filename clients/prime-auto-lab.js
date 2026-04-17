@@ -1,11 +1,11 @@
 const client = {
   clientId: "prime-auto-lab",
   shopName: "Prime Auto Lab",
-  botName: "Sofia",
+  botName: "Paola",
   city: "Kendall, Miami",
   address: "14032 SW 140th St Bay 16, Miami, FL 33186",
-  phone: "(305) 555-0000",
-  shopHours: "Monday-Saturday, 9am-6pm",
+  phone: "(786) 777-8971",
+  shopHours: "Monday-Saturday, 10am-6pm",
 
   ghlApiKey: process.env.GHL_API_KEY_PRIME_AUTO_LAB,
   ghlLocationId: "11y3Q10E1oPAk5deBJvA",
