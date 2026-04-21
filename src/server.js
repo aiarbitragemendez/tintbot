@@ -1,156 +1,272 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 const Anthropic = require("@anthropic-ai/sdk");
 const { buildSystemPrompt } = require("./system-prompt-template");
 const ghl = require("./ghl");
 
-const clients = {
-  "prime-auto-lab": require("../clients/prime-auto-lab"),
-};
+// ─── Model ────────────────────────────────────────────────────────────────────
+const MODEL = "claude-opus-4-5";
 
+// ─── Auto-load clients from clients/ directory ────────────────────────────────
+const clients = {};
+const clientsDir = path.join(__dirname, "../clients");
+fs.readdirSync(clientsDir)
+  .filter(f => f.endsWith(".js"))
+  .forEach(file => {
+    try {
+      const client = require(path.join(clientsDir, file));
+      if (!client.clientId) {
+        console.warn(`[CLIENTS] Skipping ${file} — missing clientId`);
+        return;
+      }
+      clients[client.clientId] = client;
+      console.log(`[CLIENTS] Loaded: ${client.clientId} (${client.shopName})`);
+    } catch (e) {
+      console.error(`[CLIENTS] Failed to load ${file}:`, e.message);
+    }
+  });
+
+// ─── App setup ────────────────────────────────────────────────────────────────
 const app = express();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.use(cors());
 app.use(express.json());
 
+// ─── Session store ────────────────────────────────────────────────────────────
 const sessions = new Map();
 
 function getSession(contactId, clientId) {
   const key = `${clientId}:${contactId}`;
   if (!sessions.has(key)) {
+    console.log(`[SESSION] New session: ${key}`);
     sessions.set(key, {
       clientId,
       contactId,
       messages: [],
       ghlContactId: contactId,
+      historyLoaded: false,
+      escalationMessageSent: false,
+      escalated: false,
+      _escalationSynced: false,
+      _contactSynced: false,
       collectedData: {
         name: null, phone: null, email: null,
         vehicleYear: null, vehicleMake: null, vehicleModel: null,
         windows: null, tintPackage: null, appointmentTime: null,
         _appointmentBooked: false,
       },
-      escalated: false,
     });
   }
   return sessions.get(key);
 }
 
+function isValidMessage(m) {
+  return (
+    m &&
+    typeof m.role === "string" &&
+    typeof m.content === "string" &&
+    m.content.trim() !== ""
+  );
+}
+
+// ─── /chat endpoint (for web widget use) ─────────────────────────────────────
 app.post("/chat", async (req, res) => {
   const { sessionId, clientId, message } = req.body;
-  if (!sessionId || !clientId || !message) {
-    return res.status(400).json({ error: "Missing sessionId, clientId, or message" });
+  console.log(`[CHAT] sessionId=${sessionId} clientId=${clientId} message="${message}"`);
+
+  if (!sessionId || !clientId || !message || typeof message !== "string" || message.trim() === "") {
+    return res.status(400).json({ error: "Missing or invalid sessionId, clientId, or message" });
   }
   const client = clients[clientId];
   if (!client) return res.status(404).json({ error: "Client not found" });
 
   const session = getSession(sessionId, clientId);
-  session.messages.push({ role: "user", content: message });
+  session.messages.push({ role: "user", content: String(message).trim() });
 
   try {
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: MODEL,
       max_tokens: 1024,
       system: buildSystemPrompt(client),
-      messages: session.messages,
+      messages: session.messages.filter(isValidMessage).slice(-30),
     });
     const reply = response.content[0].text;
+    console.log(`[CHAT] Reply: ${reply}`);
     session.messages.push({ role: "assistant", content: reply });
     return res.json({ reply, sessionId });
   } catch (err) {
-    console.error("Claude error:", err);
-    return res.status(500).json({ error: "AI service error" });
+    console.error("[CHAT] Claude error:", err.status, JSON.stringify(err.error || err.message));
+    const fallback = `Hi! ${client.botName} here from ${client.shopName} — what can I help you with today?`;
+    return res.status(500).json({ error: "AI service error", fallback });
   }
 });
 
+// ─── /ghl-webhook endpoint (SMS via GHL) ─────────────────────────────────────
 app.post("/ghl-webhook", async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
-  console.log("GHL WEBHOOK RECEIVED:", JSON.stringify(body));
+  console.log("[WEBHOOK] Received:", JSON.stringify(body));
 
-  if (body.direction === "outbound") return;
+  // Skip outbound (messages we sent)
+  if (body.direction === "outbound") {
+    console.log("[WEBHOOK] Skipping outbound message");
+    return;
+  }
 
+  // Match client by locationId
   const locationId = body.locationId || body.location_id || (body.location && body.location.id);
+  console.log("[WEBHOOK] Location ID:", locationId);
+
   const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
   if (!client) {
-    console.warn("No client found for locationId:", locationId);
+    console.warn("[WEBHOOK] No client matched locationId:", locationId);
     return;
   }
+  console.log("[WEBHOOK] Matched client:", client.clientId);
 
-  const inboundText = (body.message && body.message.body) || body.message || body.body || body.text || "";
+  // Extract message and contactId
+  const inboundText = (
+    (body.message && body.message.body) ||
+    body.message ||
+    body.body ||
+    body.text ||
+    ""
+  );
   const contactId = body.contactId || body.contact_id || null;
 
-  if (!inboundText || !contactId) {
-    console.warn("Missing message or contactId");
+  if (!inboundText || typeof inboundText !== "string" || inboundText.trim() === "") {
+    console.warn("[WEBHOOK] Empty or invalid message — skipping");
+    return;
+  }
+  if (!contactId) {
+    console.warn("[WEBHOOK] Missing contactId — skipping");
     return;
   }
 
-  console.log("Contact ID:", contactId);
-  console.log("Message:", inboundText);
+  const cleanText = inboundText.trim();
+  console.log("[WEBHOOK] Contact:", contactId, "| Message:", cleanText);
 
   const session = getSession(contactId, client.clientId);
-  console.log("Session messages count:", session.messages.length);
+  console.log(`[SESSION] Messages in memory: ${session.messages.length} | Escalated: ${session.escalated} | EscalationSent: ${session.escalationMessageSent}`);
 
-  // Add user message as clean string
-  session.messages.push({ role: "user", content: String(inboundText) });
+  // ── Silence logic: if escalated and message sent, only respond to simple FAQs ──
+  if (session.escalated && session.escalationMessageSent) {
+    const lcText = cleanText.toLowerCase();
+    const botCanAnswer = /\b(price|cost|how much|hours|open|location|address|how long|what film|darkness|percent|%)\b/.test(lcText);
+    if (!botCanAnswer) {
+      console.log("[ESCALATION] Session escalated — staying silent");
+      return;
+    }
+    console.log("[ESCALATION] Customer asked a simple FAQ — responding despite escalation");
+  }
 
-  // Keep only last 20 messages and ensure all are clean
-  const recentMessages = session.messages
-    .slice(-20)
-    .filter(m => m && m.role && m.content && typeof m.content === "string" && m.content.trim() !== "");
+  // ── Load GHL conversation history on first contact (handles server restarts) ──
+  if (!session.historyLoaded && client.ghlApiKey) {
+    session.historyLoaded = true;
+    console.log("[GHL HISTORY] Loading prior conversation for contact:", contactId);
+    try {
+      const history = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
+      if (history.length > 0) {
+        console.log(`[GHL HISTORY] Seeded session with ${history.length} messages`);
+        session.messages = history;
+      } else {
+        console.log("[GHL HISTORY] No prior messages found — starting fresh");
+      }
+    } catch (e) {
+      console.error("[GHL HISTORY] Failed to load history:", e.message);
+    }
+  }
+
+  // Add the new inbound message
+  session.messages.push({ role: "user", content: cleanText });
+
+  // Build clean context (last 30, validated, alternating)
+  const contextMessages = session.messages
+    .filter(isValidMessage)
+    .slice(-30);
+
+  console.log(`[CLAUDE] Sending ${contextMessages.length} messages | Model: ${MODEL}`);
 
   try {
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: MODEL,
       max_tokens: 400,
       system: buildSystemPrompt(client),
-      messages: recentMessages,
+      messages: contextMessages,
     });
 
     const reply = response.content[0].text;
-    console.log("BOT REPLY:", reply);
+    console.log("[BOT REPLY]:", reply);
 
-    // Save clean reply to session
     session.messages.push({ role: "assistant", content: String(reply) });
 
+    // Detect if this reply is an escalation message
+    const isEscalationReply = /specialist|reach out shortly|someone will reach out|forward you/i.test(reply);
+    if (isEscalationReply && !session.escalationMessageSent) {
+      session.escalationMessageSent = true;
+      session.escalated = true;
+      console.log("[ESCALATION] Escalation message sent — future messages will be silenced");
+    }
+
+    // Send reply via GHL
     try {
       await ghl.sendMessage(client.ghlApiKey, contactId, reply);
-      console.log("MESSAGE SENT SUCCESSFULLY");
+      console.log("[GHL] Message sent successfully");
     } catch (sendErr) {
-      console.error("SEND ERROR:", sendErr.message);
+      console.error("[GHL] Send error:", sendErr.message);
       if (sendErr.response) {
-        console.error("SEND ERROR DETAILS:", JSON.stringify(sendErr.response.data));
+        console.error("[GHL] Send error details:", JSON.stringify(sendErr.response.data));
       }
     }
 
-    syncData(session, client, inboundText, reply).catch(console.error);
+    // Async data extraction and GHL sync
+    syncData(session, client, cleanText, reply).catch(e =>
+      console.error("[SYNC] Unhandled error:", e.message)
+    );
 
   } catch (err) {
-    console.error("Webhook error:", err.status, JSON.stringify(err.error || err.message));
+    console.error("[CLAUDE] Error:", err.status, JSON.stringify(err.error || err.message));
     try {
-      await ghl.sendMessage(client.ghlApiKey, contactId,
-        "Hi! Sofia here from Prime Auto Lab. How can I help you today?");
-    } catch (_) {}
+      const fallback = `Hi! ${client.botName} here from ${client.shopName} — what can I help you with today?`;
+      await ghl.sendMessage(client.ghlApiKey, contactId, fallback);
+      console.log("[FALLBACK] Sent fallback message");
+    } catch (fallbackErr) {
+      console.error("[FALLBACK] Failed to send fallback:", fallbackErr.message);
+    }
   }
 });
 
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", clients: Object.keys(clients), timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    model: MODEL,
+    clients: Object.keys(clients),
+    sessions: sessions.size,
+    timestamp: new Date().toISOString(),
+  });
 });
 
+// ─── Data extraction and GHL sync ────────────────────────────────────────────
 async function syncData(session, client, userMessage, botReply) {
+  console.log("[SYNC] Starting extraction for contact:", session.contactId);
   const data = session.collectedData;
 
-  const extractionResult = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 300,
-    messages: [{
-      role: "user",
-      content: `Extract customer data from this exchange. Return ONLY valid JSON, no markdown:
+  let extracted;
+  try {
+    const extractionResult = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 300,
+      messages: [{
+        role: "user",
+        content: `Extract customer data from this exchange. Return ONLY valid JSON, no markdown, no extra text:
 {
   "name": "full name or null",
-  "phone": "phone or null",
+  "phone": "phone number or null",
   "email": "email or null",
   "vehicleYear": "year or null",
   "vehicleMake": "brand or null",
@@ -162,29 +278,36 @@ async function syncData(session, client, userMessage, botReply) {
   "isReadyToBook": false
 }
 Today is ${new Date().toISOString()}. Timezone is Miami FL (ET).
-If customer mentions a day and time like "Friday at 10am" convert it to ISO 8601.
-Set isReadyToBook to true if customer has confirmed a specific day and time.
-Customer: "${userMessage}"
-Bot: "${botReply}"
-Known: ${JSON.stringify(data)}`
-    }]
-  });
+Convert relative days/times (e.g. "Friday at 10am") to ISO 8601.
+Set isReadyToBook=true only if customer confirmed a specific day AND time.
+Set isEscalation=true if customer mentions: same-day, luxury/exotic vehicle, fleet, van, complaint, wants a human.
+Customer said: "${userMessage}"
+Bot replied: "${botReply}"
+Already known: ${JSON.stringify(data)}`
+      }]
+    });
 
-  let extracted;
-  try {
     const raw = extractionResult.content[0].text.replace(/```json|```/g, "").trim();
     extracted = JSON.parse(raw);
-    console.log("EXTRACTED DATA:", JSON.stringify(extracted));
-  } catch {
+    console.log("[SYNC] Extracted:", JSON.stringify(extracted));
+  } catch (e) {
+    console.error("[SYNC] Extraction failed:", e.message);
     return;
   }
 
+  // Merge extracted into session data
   Object.keys(extracted).forEach(k => {
-    if (extracted[k] !== null && extracted[k] !== undefined) data[k] = extracted[k];
+    if (extracted[k] !== null && extracted[k] !== undefined) {
+      data[k] = extracted[k];
+    }
   });
 
-  if (!client.ghlApiKey) return;
+  if (!client.ghlApiKey) {
+    console.warn("[SYNC] No GHL API key — skipping GHL sync");
+    return;
+  }
 
+  // ── Upsert contact ───────────────────────────────────────────────────────
   if (data.phone && !session._contactSynced) {
     session._contactSynced = true;
     const nameParts = (data.name || "Customer").trim().split(" ");
@@ -198,61 +321,95 @@ Known: ${JSON.stringify(data)}`
         email: data.email || undefined,
         tags: ["chatbot-lead", "sms-bot"],
         customFields: {
-          vehicle: `${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}`.trim(),
+          vehicle: [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" "),
           windows: data.windows || "",
           tintPackage: data.tintPackage || "",
-        }
+        },
       });
       session.ghlContactId = contact.id;
-      console.log("CONTACT SYNCED:", contact.id);
+      console.log("[SYNC] Contact upserted:", contact.id);
       if (client.ghlPipelineId) {
         await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id);
+        console.log("[SYNC] Added to pipeline");
       }
     } catch (e) {
-      console.error("Contact sync error:", e.message);
+      console.error("[SYNC] Contact sync error:", e.message);
     }
   }
 
-  console.log("BOOKING CHECK - isReadyToBook:", extracted.isReadyToBook, "appointmentTime:", data.appointmentTime, "alreadyBooked:", data._appointmentBooked, "ghlContactId:", session.ghlContactId, "contactId:", session.contactId);
+  // ── Book appointment ─────────────────────────────────────────────────────
+  const ghlContactId = session.ghlContactId || session.contactId;
+  console.log(`[SYNC] Booking check — isReadyToBook: ${extracted.isReadyToBook} | appointmentTime: ${data.appointmentTime} | alreadyBooked: ${data._appointmentBooked} | contactId: ${ghlContactId}`);
+
   if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
     data._appointmentBooked = true;
-    console.log("BOOKING APPOINTMENT AT:", data.appointmentTime);
+    console.log("[BOOKING] Booking at:", data.appointmentTime, "for contact:", ghlContactId);
     try {
-      await ghl.bookAppointment(client.ghlApiKey, client.ghlCalendarId, session.ghlContactId || session.contactId, client.ghlLocationId, {
-        startTime: data.appointmentTime,
-        title: `Tint Appointment — ${data.name || "Customer"}`,
-        notes: `Vehicle: ${data.vehicleYear || ""} ${data.vehicleMake || ""} ${data.vehicleModel || ""}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,
-      });
-      await ghl.addTag(client.ghlApiKey, session.contactId, ["appointment-booked"]);
+      await ghl.bookAppointment(
+        client.ghlApiKey,
+        client.ghlCalendarId,
+        ghlContactId,
+        client.ghlLocationId,
+        {
+          startTime: data.appointmentTime,
+          title: `Tint Appointment — ${data.name || "Customer"}`,
+          notes: `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,
+        }
+      );
+      console.log("[BOOKING] Appointment booked successfully");
+      await ghl.addTag(client.ghlApiKey, ghlContactId, ["appointment-booked"]);
       if (client.ghlConfirmationWorkflowId) {
-        await ghl.triggerWorkflow(client.ghlApiKey, session.contactId, client.ghlConfirmationWorkflowId);
+        await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlConfirmationWorkflowId);
+        console.log("[BOOKING] Confirmation workflow triggered");
       }
     } catch (e) {
-      console.error("Booking error:", e.message);
+      console.error("[BOOKING] Error:", e.message);
       if (e.response) {
-        console.error("Booking error details:", JSON.stringify(e.response.data));
-        console.error("Booking error status:", e.response.status);
+        console.error("[BOOKING] Status:", e.response.status, "Details:", JSON.stringify(e.response.data));
       }
     }
   }
 
-  if (extracted.isEscalation && !session.escalated) {
+  // ── Escalation: tag, note, notify owner ─────────────────────────────────
+  // Use _escalationSynced (not session.escalated) because the main handler may have
+  // already set session.escalated before syncData runs asynchronously.
+  if (extracted.isEscalation && !session._escalationSynced) {
+    session._escalationSynced = true;
     session.escalated = true;
+    console.log("[ESCALATION] Flagging escalation for contact:", ghlContactId);
     try {
-      await ghl.addTag(client.ghlApiKey, session.contactId, ["escalated", "needs-human"]);
-      await ghl.addNote(client.ghlApiKey, session.contactId,
-        `Bot flagged escalation.\nCustomer said: "${userMessage}"`);
+      await ghl.addTag(client.ghlApiKey, ghlContactId, ["escalated", "needs-human"]);
+      await ghl.addNote(
+        client.ghlApiKey,
+        ghlContactId,
+        `Bot escalated this conversation.\nCustomer said: "${userMessage}"\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}`
+      );
       if (client.ghlEscalationWorkflowId) {
-        await ghl.triggerWorkflow(client.ghlApiKey, session.contactId, client.ghlEscalationWorkflowId);
+        await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlEscalationWorkflowId);
+        console.log("[ESCALATION] Escalation workflow triggered");
+      }
+      // Send SMS notification to shop owner
+      if (client.notificationPhone) {
+        const notifMsg =
+          `[TintBot] Escalation needed!\n` +
+          `Name: ${data.name || "Unknown"}\n` +
+          `Phone: ${data.phone || "Unknown"}\n` +
+          `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\n` +
+          `Last msg: "${userMessage}"`;
+        await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, client.notificationPhone, notifMsg);
+        console.log("[ESCALATION] Owner notification sent to:", client.notificationPhone);
       }
     } catch (e) {
-      console.error("Escalation error:", e.message);
+      console.error("[ESCALATION] Error:", e.message);
     }
   }
 }
 
+// ─── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`TintBot running on port ${PORT}`);
-  console.log(`Clients: ${Object.keys(clients).join(", ")}`);
+  console.log(`\nTintBot running on port ${PORT}`);
+  console.log(`Model: ${MODEL}`);
+  console.log(`Clients loaded: ${Object.keys(clients).join(", ")}`);
+  console.log(`Ready.\n`);
 });

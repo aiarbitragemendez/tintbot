@@ -27,7 +27,9 @@ async function upsertContact(apiKey, { firstName, lastName, phone, email, tags =
       );
       return existing;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("[GHL] upsertContact search error:", e.message);
+  }
 
   const res = await axios.post(
     `${BASE}/contacts/`,
@@ -51,15 +53,9 @@ async function bookAppointment(apiKey, calendarId, contactId, locationId, { star
   if (notes) payload.notes = notes;
 
   const res = await axios.post(
-    `https://services.leadconnectorhq.com/calendars/events/appointments`,
+    `${BASE}/calendars/events/appointments`,
     payload,
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        Version: "2021-04-15",
-      }
-    }
+    { headers: v2Headers(apiKey) }
   );
   return res.data;
 }
@@ -111,7 +107,6 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
 async function sendMessage(apiKey, contactId, message, locationId) {
   const headers = v2Headers(apiKey);
 
-  // Search for existing conversation, including locationId if provided
   const searchUrl = locationId
     ? `${BASE}/conversations/search?contactId=${contactId}&locationId=${locationId}`
     : `${BASE}/conversations/search?contactId=${contactId}`;
@@ -119,16 +114,15 @@ async function sendMessage(apiKey, contactId, message, locationId) {
   let conversationId;
   try {
     const convResponse = await axios.get(searchUrl, { headers });
-    console.log("CONVERSATIONS FOUND:", JSON.stringify(convResponse.data));
+    console.log("[GHL] Conversations found:", JSON.stringify(convResponse.data));
     const conversations = convResponse.data?.conversations;
     if (conversations && conversations.length > 0) {
       conversationId = conversations[0].id;
     }
   } catch (e) {
-    console.error("Conversation search error:", e.message);
+    console.error("[GHL] Conversation search error:", e.message);
   }
 
-  // If no conversation found, create one
   if (!conversationId) {
     if (!locationId) throw new Error("No conversation found and no locationId to create one");
     const createRes = await axios.post(
@@ -138,10 +132,9 @@ async function sendMessage(apiKey, contactId, message, locationId) {
     );
     conversationId = createRes.data?.conversation?.id || createRes.data?.id;
     if (!conversationId) throw new Error("Failed to create conversation");
-    console.log("Created new conversation:", conversationId);
+    console.log("[GHL] Created new conversation:", conversationId);
   }
 
-  // Send message to the conversation
   const res = await axios.post(
     `${BASE}/conversations/messages`,
     { type: "SMS", message, conversationId, contactId },
@@ -150,10 +143,125 @@ async function sendMessage(apiKey, contactId, message, locationId) {
   return res.data;
 }
 
+// Fetch last N messages from GHL conversation and convert to Claude message format
+async function getConversationMessages(apiKey, contactId, limit = 30) {
+  const headers = v2Headers(apiKey);
+
+  // Step 1: Find conversation for this contact
+  let conversationId;
+  try {
+    const convResponse = await axios.get(
+      `${BASE}/conversations/search?contactId=${contactId}`,
+      { headers }
+    );
+    const conversations = convResponse.data?.conversations;
+    if (!conversations || conversations.length === 0) {
+      console.log("[GHL HISTORY] No conversation found for contact:", contactId);
+      return [];
+    }
+    conversationId = conversations[0].id;
+    console.log("[GHL HISTORY] Found conversation:", conversationId);
+  } catch (e) {
+    console.error("[GHL HISTORY] Conversation search error:", e.message);
+    return [];
+  }
+
+  // Step 2: Fetch messages from conversation
+  try {
+    const msgResponse = await axios.get(
+      `${BASE}/conversations/${conversationId}/messages?limit=${limit}`,
+      { headers }
+    );
+    const rawMessages = msgResponse.data?.messages?.messages || msgResponse.data?.messages || [];
+    console.log("[GHL HISTORY] Raw messages fetched:", rawMessages.length);
+
+    // Step 3: Convert to Claude format (inbound=user, outbound=assistant)
+    const claudeMessages = rawMessages
+      .filter(m => m.body && typeof m.body === "string" && m.body.trim() !== "")
+      .map(m => ({
+        role: m.direction === "inbound" ? "user" : "assistant",
+        content: m.body.trim(),
+      }));
+
+    // Ensure messages alternate correctly (Claude requires user/assistant alternation)
+    const deduplicated = [];
+    for (const msg of claudeMessages) {
+      const last = deduplicated[deduplicated.length - 1];
+      if (last && last.role === msg.role) {
+        // Merge consecutive same-role messages
+        last.content += "\n" + msg.content;
+      } else {
+        deduplicated.push({ ...msg });
+      }
+    }
+
+    // Claude requires first message to be from user
+    while (deduplicated.length > 0 && deduplicated[0].role !== "user") {
+      deduplicated.shift();
+    }
+
+    console.log("[GHL HISTORY] Converted to", deduplicated.length, "Claude messages");
+    return deduplicated.slice(-limit);
+  } catch (e) {
+    console.error("[GHL HISTORY] Message fetch error:", e.message);
+    return [];
+  }
+}
+
+// Send an SMS to a specific phone number (used for escalation notifications)
+async function sendSMSToPhone(apiKey, locationId, phone, message) {
+  const headers = v2Headers(apiKey);
+
+  // Find or create a contact with this phone number
+  let contactId;
+  try {
+    const search = await axios.get(
+      `${BASE}/contacts/search?phone=${encodeURIComponent(phone)}&locationId=${locationId}`,
+      { headers }
+    );
+    if (search.data?.contacts?.length > 0) {
+      contactId = search.data.contacts[0].id;
+      console.log("[GHL] Found notification contact:", contactId);
+    }
+  } catch (e) {
+    console.error("[GHL] Notification contact search error:", e.message);
+  }
+
+  if (!contactId) {
+    try {
+      const createRes = await axios.post(
+        `${BASE}/contacts/`,
+        { phone, locationId, tags: ["staff-notification"] },
+        { headers }
+      );
+      contactId = createRes.data?.contact?.id;
+      console.log("[GHL] Created notification contact:", contactId);
+    } catch (e) {
+      console.error("[GHL] Failed to create notification contact:", e.message);
+      throw e;
+    }
+  }
+
+  if (!contactId) throw new Error("Could not find or create contact for phone: " + phone);
+
+  return sendMessage(apiKey, contactId, message, locationId);
+}
+
 function addHours(isoString, hours) {
   const d = new Date(isoString);
   d.setHours(d.getHours() + hours);
   return d.toISOString();
 }
 
-module.exports = { upsertContact, bookAppointment, getAvailableSlots, addToPipeline, addNote, addTag, triggerWorkflow, sendMessage };
+module.exports = {
+  upsertContact,
+  bookAppointment,
+  getAvailableSlots,
+  addToPipeline,
+  addNote,
+  addTag,
+  triggerWorkflow,
+  sendMessage,
+  getConversationMessages,
+  sendSMSToPhone,
+};
