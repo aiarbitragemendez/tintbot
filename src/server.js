@@ -148,10 +148,52 @@ app.post("/ghl-webhook", async (req, res) => {
   }
 
   const cleanText = inboundText.trim();
+
+  // Detect inbound channel and map to outbound GHL type
+  const inboundChannel = body.type || body.messageType || body.channel || "SMS";
+  const channelStr = String(inboundChannel).toLowerCase();
+  let outboundType = "SMS";
+  if (channelStr.includes("ig") || channelStr.includes("instagram")) {
+    outboundType = "IG";
+  } else if (channelStr.includes("fb") || channelStr.includes("facebook")) {
+    outboundType = "FB";
+  } else if (channelStr.includes("live") || channelStr.includes("chat")) {
+    outboundType = "Live_Chat";
+  } else if (channelStr.includes("email")) {
+    outboundType = "Email";
+  }
+  console.log(`[WEBHOOK] Inbound channel: ${inboundChannel} | Outbound type: ${outboundType}`);
   console.log("[WEBHOOK] Contact:", contactId, "| Message:", cleanText);
 
   const session = getSession(contactId, client.clientId);
   console.log(`[SESSION] Messages in memory: ${session.messages.length} | Escalated: ${session.escalated} | EscalationSent: ${session.escalationMessageSent}`);
+
+  // ── Confirmation-reply filter: ignore short "yes/ok/thanks" after booking ──
+  const confirmationPatterns = /^(yes|ok|okay|done|confirmed|thanks|thank you|got it|yep|yeah|sounds good|perfect|k|kk|ty)[.!\s]*$/i;
+  const isShortConfirmation =
+    cleanText.length < 15 && confirmationPatterns.test(cleanText.trim());
+
+  if (isShortConfirmation) {
+    if (session.collectedData._appointmentBooked) {
+      console.log("CONFIRMATION REPLY — IGNORED");
+      return;
+    }
+    // Also check GHL contact tags for appointment-booked / confirmed
+    if (client.ghlApiKey) {
+      try {
+        if (!session._cachedTags) {
+          session._cachedTags = await ghl.getContactTags(client.ghlApiKey, contactId);
+        }
+        const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
+        if (tags.includes("appointment-booked") || tags.includes("confirmed")) {
+          console.log("CONFIRMATION REPLY — IGNORED");
+          return;
+        }
+      } catch (e) {
+        console.error("[CONFIRMATION] Tag lookup error:", e.message);
+      }
+    }
+  }
 
   // ── Silence logic: if escalated and message sent, only respond to simple FAQs ──
   if (session.escalated && session.escalationMessageSent) {
@@ -212,9 +254,9 @@ app.post("/ghl-webhook", async (req, res) => {
       console.log("[ESCALATION] Escalation message sent — future messages will be silenced");
     }
 
-    // Send reply via GHL
+    // Send reply via GHL on the same channel the customer used
     try {
-      await ghl.sendMessage(client.ghlApiKey, contactId, reply);
+      await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
       console.log("[GHL] Message sent successfully");
     } catch (sendErr) {
       console.error("[GHL] Send error:", sendErr.message);
@@ -232,7 +274,7 @@ app.post("/ghl-webhook", async (req, res) => {
     console.error("[CLAUDE] Error:", err.status, JSON.stringify(err.error || err.message));
     try {
       const fallback = `Hi! ${client.botName} here from ${client.shopName} — what can I help you with today?`;
-      await ghl.sendMessage(client.ghlApiKey, contactId, fallback);
+      await ghl.sendMessage(client.ghlApiKey, contactId, fallback, client.ghlLocationId, outboundType);
       console.log("[FALLBACK] Sent fallback message");
     } catch (fallbackErr) {
       console.error("[FALLBACK] Failed to send fallback:", fallbackErr.message);
@@ -388,16 +430,20 @@ Already known: ${JSON.stringify(data)}`
         await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlEscalationWorkflowId);
         console.log("[ESCALATION] Escalation workflow triggered");
       }
-      // Send SMS notification to shop owner
-      if (client.notificationPhone) {
+      // Send SMS notification to shop owner (once per conversation)
+      const ownerPhone = client.escalationPhone || client.notificationPhone;
+      if (ownerPhone && !session.escalationMessageSent) {
+        const vehicle = [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown";
         const notifMsg =
-          `[TintBot] Escalation needed!\n` +
-          `Name: ${data.name || "Unknown"}\n` +
-          `Phone: ${data.phone || "Unknown"}\n` +
-          `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\n` +
-          `Last msg: "${userMessage}"`;
-        await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, client.notificationPhone, notifMsg);
-        console.log("[ESCALATION] Owner notification sent to:", client.notificationPhone);
+          `🚨 New lead needs follow-up from ${data.name || "Unknown"} at ${data.phone || "Unknown"}. ` +
+          `Vehicle: ${vehicle}. ` +
+          `Reason: ${userMessage}. ` +
+          `Last message: ${userMessage}`;
+        await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
+        session.escalationMessageSent = true;
+        console.log("[ESCALATION] Owner notification sent to:", ownerPhone);
+      } else if (session.escalationMessageSent) {
+        console.log("[ESCALATION] Owner notification already sent — skipping");
       }
     } catch (e) {
       console.error("[ESCALATION] Error:", e.message);

@@ -104,7 +104,7 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
   return res.data;
 }
 
-async function sendMessage(apiKey, contactId, message, locationId) {
+async function sendMessage(apiKey, contactId, message, locationId, type = "SMS") {
   const headers = v2Headers(apiKey);
 
   const searchUrl = locationId
@@ -135,9 +135,10 @@ async function sendMessage(apiKey, contactId, message, locationId) {
     console.log("[GHL] Created new conversation:", conversationId);
   }
 
+  console.log(`[GHL] Sending message via channel: ${type}`);
   const res = await axios.post(
     `${BASE}/conversations/messages`,
-    { type: "SMS", message, conversationId, contactId },
+    { type, message, conversationId, contactId },
     { headers }
   );
   return res.data;
@@ -208,6 +209,22 @@ async function getConversationMessages(apiKey, contactId, limit = 30) {
   }
 }
 
+// Fetch tags for a given contact
+async function getContactTags(apiKey, contactId) {
+  const headers = v2Headers(apiKey);
+  try {
+    const res = await axios.get(
+      `${BASE}/contacts/${contactId}`,
+      { headers }
+    );
+    const tags = res.data?.contact?.tags || res.data?.tags || [];
+    return Array.isArray(tags) ? tags : [];
+  } catch (e) {
+    console.error("[GHL] getContactTags error:", e.message);
+    return [];
+  }
+}
+
 // Send an SMS to a specific phone number (used for escalation notifications)
 async function sendSMSToPhone(apiKey, locationId, phone, message) {
   const headers = v2Headers(apiKey);
@@ -263,5 +280,6 @@ module.exports = {
   triggerWorkflow,
   sendMessage,
   getConversationMessages,
+  getContactTags,
   sendSMSToPhone,
 };

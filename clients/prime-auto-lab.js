@@ -8,6 +8,7 @@ const client = {
   shopHours: "Monday-Saturday, 10am-6pm",
 
   notificationPhone: "7867778971",
+  escalationPhone: "7862804874",
 
   ghlApiKey: process.env.GHL_API_KEY_PRIME_AUTO_LAB,
   ghlLocationId: "11y3Q10E1oPAk5deBJvA",
