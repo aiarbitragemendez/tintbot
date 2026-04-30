@@ -1,6 +1,6 @@
 const client = {
-  clientId: "prime-auto-lab",
-  shopName: "Prime Auto Lab",
+  clientId: "dr-tints",
+  shopName: "Dr. Tints",
   botName: "Camila",
   city: "Kendall, Miami",
   address: "14032 SW 140th St Bay 16, Miami, FL 33186",
