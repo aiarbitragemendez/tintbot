@@ -1,6 +1,6 @@
 const client = {
-  clientId: "dr-tints",
-  shopName: "Dr. Tints",
+  clientId: "prime-auto-lab",
+  shopName: "Prime Auto Lab",
   botName: "Camila",
   city: "Kendall, Miami",
   address: "14032 SW 140th St Bay 16, Miami, FL 33186",
@@ -19,41 +19,22 @@ const client = {
   pricingGuide: `
 PRICING RULES — FOLLOW EXACTLY:
 
-All "full car" pricing is SIDES + REAR ONLY. Windshield is always quoted separately and only if asked.
+When a customer says "full car" or "whole car" — quote ONLY sides and rear which is $249. Do not include windshield unless they specifically ask. Say something like "Full car tint (sides and rear) is $249. Want me to get you scheduled?"
 
-Pricing depends on vehicle type. ALWAYS ask what vehicle they have before quoting if you don't already know.
+Only add windshield price if customer specifically mentions windshield or asks about it separately — it is an additional $120-$150.
 
-VEHICLE TYPES:
-- Coupes (2-door): e.g. Mustang, Camaro, Challenger, Civic coupe, BRZ
-- Sedans / Small SUVs: e.g. Civic, Camry, Accord, Corolla, RAV4, CR-V, Model Y, Model 3
-- Large SUVs / Trucks: e.g. Tahoe, Suburban, Yukon, F-150, Silverado, RAM, 3rd-row SUVs
-
-FULL CAR (SIDES + REAR):
-- Coupes: Ceramic $249 / Nano-Ceramic $375
-- Sedans / Small SUVs: Ceramic $295 / Nano-Ceramic $449
-- Large SUVs / Trucks: Ceramic $349 / Nano-Ceramic $525
-
-When a customer says "full car" or "whole car" — quote ONLY sides and rear for their vehicle type. Do not include windshield unless they specifically ask. Default to Ceramic price unless they ask about Nano. Example: "Full car tint (sides and rear) on a Civic is $295 in Ceramic. Want me to get you scheduled?"
-
-ADD-ONS (only quote if customer asks):
-- Front two windows only — Ceramic: $120
-- Front two windows only — Nano-Ceramic: $220
-- Full windshield — Ceramic: $150
-- Full windshield — Nano-Ceramic: $250
-- Sunroof / panoramic roof: $50-$120
-- Sun strip: $60-$80
-- Old tint removal: $75-$100 (FREE with Nano-Ceramic upgrade)
-- Glass coating — windshield only: $79
-- Glass coating — windshield + front sides: $129
-- Glass coating — all glass: $179 (FREE with Nano-Ceramic + Full Windshield combo)
-
-NANO-CERAMIC UPGRADE PERKS — mention these when customer is on the fence between Ceramic and Nano:
-- Free old tint removal with Nano upgrade
-- Free all-glass coating when they get Nano + Full Windshield
+Quote each service separately and only when asked:
+- Sides and rear (full car): $249 flat
+- Front two windows only: $120-$150
+- Full front windshield: $120-$150 additional
+- Sunroof or panoramic: $50-$100 additional
+- Sun strip: $40-$60 additional
+- Tint removal: $50-$100 additional
 
 Never combine prices unless the customer asks about multiple services in the same message.
-Give the exact price for exactly what they asked — only use ranges for sun strip and tint removal where the range is real.
-We offer darkness from 5% to 70%. Florida tint law compliant. 100% guaranteed.
+Never give a range like $250-$300 — give the exact price for exactly what they asked.
+If customer asks about nano-ceramic or better film — say it is available for $50-$150 more depending on the package.
+We offer darkness from 5% to 70%.
 `,
 
   faqText: `
