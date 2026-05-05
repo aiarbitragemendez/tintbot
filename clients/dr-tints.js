@@ -10,7 +10,8 @@ const client = {
   notificationPhone: "7867778971",
   escalationPhone: "7862804874",
 
-  ghlApiKey: process.env.GHL_API_KEY_PRIME_AUTO_LAB,
+  // Prefers the renamed env var; falls back to legacy name during Railway rename rollout
+  ghlApiKey: process.env.GHL_API_KEY_DR_TINTS || process.env.GHL_API_KEY_PRIME_AUTO_LAB,
   ghlLocationId: "11y3Q10E1oPAk5deBJvA",
   ghlCalendarId: "niAbBzZJ9az0cylStfxo",
   ghlPipelineId: "11y3Q10E1oPAk5deBJvA",
@@ -51,7 +52,7 @@ Q: How soon can I roll down my windows?
 A: Wait at least 3-5 days to let the tint fully cure.
 
 Q: What film types do you offer?
-A: Nano-Ceramic (98% heat rejection, 7-10 year warranty) and Standard Ceramic (40% heat rejection, 3-5 year warranty). Both are premium films that won't interfere with electronics.
+A: Nano-Ceramic (98% heat rejection, 7-10 year warranty) and Standard Ceramic (60% heat rejection, 3-5 year warranty). Both are premium films that won't interfere with electronics.
 
 Q: Will tinting interfere with my GPS or electronics?
 A: No, our ceramic films do not interfere with any signals or electronics.

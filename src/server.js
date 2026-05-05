@@ -152,18 +152,37 @@ app.post("/ghl-webhook", async (req, res) => {
   // Detect inbound channel and map to outbound GHL type
   const inboundChannel = body.type || body.messageType || body.channel || "SMS";
   const channelStr = String(inboundChannel).toLowerCase();
-  let outboundType = "SMS";
-  if (channelStr.includes("ig") || channelStr.includes("instagram")) {
-    outboundType = "IG";
-  } else if (channelStr.includes("fb") || channelStr.includes("facebook")) {
-    outboundType = "FB";
-  } else if (channelStr.includes("live") || channelStr.includes("chat")) {
-    outboundType = "Live_Chat";
-  } else if (channelStr.includes("email")) {
-    outboundType = "Email";
+
+  // Allowed channels: SMS, Instagram DM, Facebook DM. Email and GMB are flagged for manual review.
+  const isSMS = channelStr.includes("sms");
+  const isIG = channelStr.includes("ig") || channelStr.includes("instagram");
+  const isFB = channelStr.includes("fb") || channelStr.includes("facebook");
+  const isLiveChat = channelStr.includes("live") || channelStr.includes("chat");
+  const isEmail = channelStr.includes("email");
+  const isGMB = channelStr.includes("gmb") || channelStr.includes("google");
+
+  console.log(`[WEBHOOK] 📨 Inbound channel detected: "${inboundChannel}" (raw: type=${body.type} messageType=${body.messageType} channel=${body.channel})`);
+
+  if (isEmail || isGMB) {
+    console.warn(`[WEBHOOK] ⚠️ Channel "${inboundChannel}" not handled by bot — flagged for manual review. Skipping reply.`);
+    return;
   }
-  console.log(`[WEBHOOK] Inbound channel: ${inboundChannel} | Outbound type: ${outboundType}`);
+
+  let outboundType = "SMS";
+  if (isIG) outboundType = "IG";
+  else if (isFB) outboundType = "FB";
+  else if (isLiveChat) outboundType = "Live_Chat";
+  else if (isSMS) outboundType = "SMS";
+  else {
+    console.warn(`[WEBHOOK] Unknown channel "${inboundChannel}" — defaulting to SMS reply`);
+  }
+
+  console.log(`[WEBHOOK] ✅ Processing on channel: ${outboundType}`);
   console.log("[WEBHOOK] Contact:", contactId, "| Message:", cleanText);
+
+  // Stash channel on session so async paths (e.g. booking failure fallback) can reply on the right channel
+  const sessionForChannel = getSession(contactId, client.clientId);
+  sessionForChannel._lastChannel = outboundType;
 
   const session = getSession(contactId, client.clientId);
   console.log(`[SESSION] Messages in memory: ${session.messages.length} | Escalated: ${session.escalated} | EscalationSent: ${session.escalationMessageSent}`);
@@ -384,10 +403,10 @@ Already known: ${JSON.stringify(data)}`
   console.log(`[SYNC] Booking check — isReadyToBook: ${extracted.isReadyToBook} | appointmentTime: ${data.appointmentTime} | alreadyBooked: ${data._appointmentBooked} | contactId: ${ghlContactId}`);
 
   if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
-    data._appointmentBooked = true;
+    data._appointmentBooked = true; // optimistically lock; reset on failure below
     console.log("[BOOKING] Booking at:", data.appointmentTime, "for contact:", ghlContactId);
     try {
-      await ghl.bookAppointment(
+      const bookingResult = await ghl.bookAppointment(
         client.ghlApiKey,
         client.ghlCalendarId,
         ghlContactId,
@@ -395,19 +414,47 @@ Already known: ${JSON.stringify(data)}`
         {
           startTime: data.appointmentTime,
           title: `Tint Appointment — ${data.name || "Customer"}`,
-          notes: `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via SMS bot`,
+          notes: `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via ${client.shopName} bot`,
         }
       );
-      console.log("[BOOKING] Appointment booked successfully");
+      console.log("[BOOKING] ✅ Appointment booked successfully:", JSON.stringify(bookingResult));
       await ghl.addTag(client.ghlApiKey, ghlContactId, ["appointment-booked"]);
       if (client.ghlConfirmationWorkflowId) {
         await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlConfirmationWorkflowId);
         console.log("[BOOKING] Confirmation workflow triggered");
       }
     } catch (e) {
-      console.error("[BOOKING] Error:", e.message);
-      if (e.response) {
-        console.error("[BOOKING] Status:", e.response.status, "Details:", JSON.stringify(e.response.data));
+      // Booking failed — DO NOT pretend it succeeded. Reset flag, message customer, escalate.
+      data._appointmentBooked = false;
+      console.error("[BOOKING] ❌ FAILED — falling back gracefully and escalating");
+
+      // 1. Tell the customer something honest and reassuring on whichever channel they came in on
+      try {
+        const fallbackMsg = "Let me have someone confirm that for you — one moment!";
+        // Try to detect outbound channel from session if stored, else default SMS
+        const outboundType = session._lastChannel || "SMS";
+        await ghl.sendMessage(client.ghlApiKey, session.contactId, fallbackMsg, client.ghlLocationId, outboundType);
+        console.log("[BOOKING] Sent graceful fallback message to customer");
+      } catch (sendErr) {
+        console.error("[BOOKING] Could not send fallback message:", sendErr.message);
+      }
+
+      // 2. Tag and notify the shop owner so the booking gets manually completed
+      try {
+        await ghl.addTag(client.ghlApiKey, ghlContactId, ["booking-failed", "needs-human"]);
+        await ghl.addNote(
+          client.ghlApiKey,
+          ghlContactId,
+          `BOOKING FAILED — bot tried to schedule ${data.appointmentTime} but GHL API returned an error. Manual booking required.\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}\nError: ${e.response?.status || ""} ${e.message}`
+        );
+        const ownerPhone = client.escalationPhone || client.notificationPhone;
+        if (ownerPhone) {
+          const notifMsg = `🚨 Booking failed for ${data.name || "Unknown"} (${data.phone || "no phone"}) at ${data.appointmentTime}. Manual confirmation needed. Reason: ${e.response?.status || ""} ${e.message}`;
+          await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
+          console.log("[BOOKING] Owner notified of booking failure:", ownerPhone);
+        }
+      } catch (escErr) {
+        console.error("[BOOKING] Escalation after failure also errored:", escErr.message);
       }
     }
   }

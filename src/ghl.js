@@ -52,12 +52,43 @@ async function bookAppointment(apiKey, calendarId, contactId, locationId, { star
   };
   if (notes) payload.notes = notes;
 
-  const res = await axios.post(
-    `${BASE}/calendars/events/appointments`,
-    payload,
-    { headers: v2Headers(apiKey) }
-  );
-  return res.data;
+  // Mask API key for safe logging
+  const safePayload = { ...payload };
+  console.log("[BOOKING] →", `${BASE}/calendars/events/appointments`);
+  console.log("[BOOKING] Payload:", JSON.stringify(safePayload));
+
+  try {
+    const res = await axios.post(
+      `${BASE}/calendars/events/appointments`,
+      payload,
+      { headers: v2Headers(apiKey), validateStatus: () => true }
+    );
+
+    console.log(`[BOOKING] GHL response: ${res.status}`);
+    console.log("[BOOKING] Response body:", JSON.stringify(res.data));
+
+    if (res.status < 200 || res.status >= 300) {
+      const err = new Error(`GHL booking failed with status ${res.status}`);
+      err.status = res.status;
+      err.response = { status: res.status, data: res.data };
+      // Surface scope/permission issues clearly
+      if (res.status === 401 || res.status === 403) {
+        console.error("[BOOKING] ⚠️ AUTH ERROR — check GHL Private Integration token scopes for: calendars.write, calendars/events.write");
+      }
+      throw err;
+    }
+
+    const appointmentId = res.data?.id || res.data?.appointment?.id || res.data?.event?.id;
+    console.log(`[BOOKING] ✅ Appointment created — ID: ${appointmentId || "unknown (check response body above)"}`);
+    return res.data;
+  } catch (e) {
+    if (e.response) {
+      console.error(`[BOOKING] ❌ Status: ${e.response.status} | Details:`, JSON.stringify(e.response.data));
+    } else {
+      console.error("[BOOKING] ❌ Network/unknown error:", e.message);
+    }
+    throw e;
+  }
 }
 
 async function getAvailableSlots(apiKey, calendarId, startDate, endDate) {
