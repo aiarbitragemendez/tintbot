@@ -149,55 +149,88 @@ app.post("/ghl-webhook", async (req, res) => {
 
   const cleanText = inboundText.trim();
 
-  // Detect inbound channel and map to outbound GHL type
+  // ── Detect inbound channel — accept ALL channels ─────────────────────────
   const inboundChannel = body.type || body.messageType || body.channel || "SMS";
   const channelStr = String(inboundChannel).toLowerCase();
 
-  // Allowed channels: SMS, Instagram DM, Facebook DM. Email and GMB are flagged for manual review.
   const isSMS = channelStr.includes("sms");
   const isIG = channelStr.includes("ig") || channelStr.includes("instagram");
-  const isFB = channelStr.includes("fb") || channelStr.includes("facebook");
+  const isFB = channelStr.includes("fb") || channelStr.includes("facebook") || channelStr.includes("messenger");
   const isLiveChat = channelStr.includes("live") || channelStr.includes("chat");
   const isEmail = channelStr.includes("email");
   const isGMB = channelStr.includes("gmb") || channelStr.includes("google");
+  const isWhatsApp = channelStr.includes("whatsapp") || channelStr.includes("wa");
+  const isCustom = channelStr.includes("custom");
 
-  console.log(`[WEBHOOK] 📨 Inbound channel detected: "${inboundChannel}" (raw: type=${body.type} messageType=${body.messageType} channel=${body.channel})`);
-
-  if (isEmail || isGMB) {
-    console.warn(`[WEBHOOK] ⚠️ Channel "${inboundChannel}" not handled by bot — flagged for manual review. Skipping reply.`);
-    return;
-  }
-
+  // Outbound `type` for GHL conversations/messages must match inbound
   let outboundType = "SMS";
   if (isIG) outboundType = "IG";
   else if (isFB) outboundType = "FB";
+  else if (isGMB) outboundType = "GMB";
+  else if (isEmail) outboundType = "Email";
   else if (isLiveChat) outboundType = "Live_Chat";
+  else if (isWhatsApp) outboundType = "WhatsApp";
+  else if (isCustom) outboundType = "Custom";
   else if (isSMS) outboundType = "SMS";
-  else {
-    console.warn(`[WEBHOOK] Unknown channel "${inboundChannel}" — defaulting to SMS reply`);
+  else console.warn(`[WEBHOOK] Unknown channel "${inboundChannel}" — defaulting outbound to SMS`);
+
+  console.log(`[WEBHOOK] 📨 channel="${inboundChannel}" → outbound="${outboundType}" | contact=${contactId} | msg="${cleanText.slice(0, 100)}"`);
+
+  // STOP / opt-out keywords are handled by GHL natively — just log and exit
+  if (/^(stop|stopall|unsubscribe|cancel|end|quit)$/i.test(cleanText)) {
+    console.log(`[WEBHOOK] 🛑 Opt-out keyword detected ("${cleanText}") — GHL handles compliance, skipping bot reply`);
+    return;
   }
 
-  console.log(`[WEBHOOK] ✅ Processing on channel: ${outboundType}`);
-  console.log("[WEBHOOK] Contact:", contactId, "| Message:", cleanText);
-
-  // Stash channel on session so async paths (e.g. booking failure fallback) can reply on the right channel
-  const sessionForChannel = getSession(contactId, client.clientId);
-  sessionForChannel._lastChannel = outboundType;
-
   const session = getSession(contactId, client.clientId);
-  console.log(`[SESSION] Messages in memory: ${session.messages.length} | Escalated: ${session.escalated} | EscalationSent: ${session.escalationMessageSent}`);
+  session._lastChannel = outboundType;
+  console.log(`[SESSION] in-memory msgs=${session.messages.length} | escalated=${session.escalated} | escSent=${session.escalationMessageSent}`);
 
-  // ── Confirmation-reply filter: ignore short "yes/ok/thanks" after booking ──
+  // ── Load GHL conversation history FIRST so all guards below have full context ──
+  if (!session.historyLoaded && client.ghlApiKey) {
+    session.historyLoaded = true;
+    console.log("[GHL HISTORY] Loading prior conversation for contact:", contactId);
+    try {
+      const history = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
+      if (history.length > 0) {
+        // Stamp loaded history as "old" so the dedup guard never matches against pre-restart messages
+        const old = Date.now() - 60 * 60 * 1000;
+        session.messages = history.map(m => ({ ...m, _ts: old }));
+        console.log(`[GHL HISTORY] ✅ Seeded session with ${history.length} messages from GHL`);
+      } else {
+        console.log("[GHL HISTORY] No prior messages — fresh conversation");
+      }
+    } catch (e) {
+      console.error("[GHL HISTORY] Failed to load history:", e.message);
+    }
+  }
+
+  // ── Cold-confirmation guard: short "yes/ok/no" with no recent bot reply = GHL automation reply ──
+  // Only treat as automation confirmation if BOTH:
+  //   - message ≤ 5 chars after trim
+  //   - no assistant message in the thread (prefer last 10 min, but any prior bot msg also counts as live thread)
+  const trimmedLc = cleanText.trim().toLowerCase();
+  const isShortYesNo = /^(yes|y|yeah|yep|yup|done|ok|okay|k|no|n|nope)[.!\s]*$/i.test(trimmedLc) && trimmedLc.length <= 5;
+
+  if (isShortYesNo) {
+    const hasAnyBotMsg = session.messages.some(m => m.role === "assistant");
+    if (!hasAnyBotMsg) {
+      console.log(`[WEBHOOK] 🚫 SUPPRESSED — short reply "${cleanText}" with no prior bot msg (likely GHL automation confirmation)`);
+      return;
+    }
+    console.log(`[WEBHOOK] ✅ Short reply "${cleanText}" — prior bot message exists, processing in context`);
+  }
+
+  // ── Post-booking short-confirmation filter (existing logic, kept) ──
   const confirmationPatterns = /^(yes|ok|okay|done|confirmed|thanks|thank you|got it|yep|yeah|sounds good|perfect|k|kk|ty)[.!\s]*$/i;
   const isShortConfirmation =
     cleanText.length < 15 && confirmationPatterns.test(cleanText.trim());
 
   if (isShortConfirmation) {
     if (session.collectedData._appointmentBooked) {
-      console.log("CONFIRMATION REPLY — IGNORED");
+      console.log("CONFIRMATION REPLY — IGNORED (appointment booked)");
       return;
     }
-    // Also check GHL contact tags for appointment-booked / confirmed
     if (client.ghlApiKey) {
       try {
         if (!session._cachedTags) {
@@ -205,7 +238,7 @@ app.post("/ghl-webhook", async (req, res) => {
         }
         const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
         if (tags.includes("appointment-booked") || tags.includes("confirmed")) {
-          console.log("CONFIRMATION REPLY — IGNORED");
+          console.log("CONFIRMATION REPLY — IGNORED (tag match)");
           return;
         }
       } catch (e) {
@@ -225,32 +258,18 @@ app.post("/ghl-webhook", async (req, res) => {
     console.log("[ESCALATION] Customer asked a simple FAQ — responding despite escalation");
   }
 
-  // ── Load GHL conversation history on first contact (handles server restarts) ──
-  if (!session.historyLoaded && client.ghlApiKey) {
-    session.historyLoaded = true;
-    console.log("[GHL HISTORY] Loading prior conversation for contact:", contactId);
-    try {
-      const history = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
-      if (history.length > 0) {
-        console.log(`[GHL HISTORY] Seeded session with ${history.length} messages`);
-        session.messages = history;
-      } else {
-        console.log("[GHL HISTORY] No prior messages found — starting fresh");
-      }
-    } catch (e) {
-      console.error("[GHL HISTORY] Failed to load history:", e.message);
-    }
-  }
+  // (history was loaded above, before all guards)
 
-  // Add the new inbound message
-  session.messages.push({ role: "user", content: cleanText });
+  // Add the new inbound message (with timestamp for dedup logic)
+  session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
 
   // Build clean context (last 30, validated, alternating)
   const contextMessages = session.messages
     .filter(isValidMessage)
-    .slice(-30);
+    .slice(-30)
+    .map(({ role, content }) => ({ role, content })); // strip _ts before sending to Claude
 
-  console.log(`[CLAUDE] Sending ${contextMessages.length} messages | Model: ${MODEL}`);
+  console.log(`[CLAUDE] Sending ${contextMessages.length} messages | history=${session.messages.length} | Model: ${MODEL}`);
 
   try {
     const response = await anthropic.messages.create({
@@ -263,7 +282,19 @@ app.post("/ghl-webhook", async (req, res) => {
     const reply = response.content[0].text;
     console.log("[BOT REPLY]:", reply);
 
-    session.messages.push({ role: "assistant", content: String(reply) });
+    // ── Deduplication guard: don't re-send identical/near-identical message within 2 min ──
+    const twoMinAgo = Date.now() - 2 * 60 * 1000;
+    const lastBot = [...session.messages].reverse().find(m => m.role === "assistant");
+    if (lastBot && lastBot._ts && lastBot._ts > twoMinAgo) {
+      const sim = similarity(String(lastBot.content), String(reply));
+      if (sim >= 0.9) {
+        console.warn(`[DEDUP] 🚫 SUPPRESSED — bot was about to send a ${(sim * 100).toFixed(0)}% match of last msg sent ${Math.round((Date.now() - lastBot._ts) / 1000)}s ago`);
+        console.warn(`[DEDUP] Suppressed text: "${reply}"`);
+        return;
+      }
+    }
+
+    session.messages.push({ role: "assistant", content: String(reply), _ts: Date.now() });
 
     // Detect if this reply is an escalation message
     const isEscalationReply = /specialist|reach out shortly|someone will reach out|forward you/i.test(reply);
@@ -276,11 +307,14 @@ app.post("/ghl-webhook", async (req, res) => {
     // Send reply via GHL on the same channel the customer used
     try {
       await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
-      console.log("[GHL] Message sent successfully");
+      console.log(`[GHL] ✅ Sent on channel ${outboundType}`);
     } catch (sendErr) {
       console.error("[GHL] Send error:", sendErr.message);
       if (sendErr.response) {
         console.error("[GHL] Send error details:", JSON.stringify(sendErr.response.data));
+        if (sendErr.response.status === 401 || sendErr.response.status === 403) {
+          console.error(`[GHL] ⚠️ AUTH ERROR sending on ${outboundType} — Private Integration token may be missing scopes for this channel. Check: conversations.write, conversations/message.write, plus channel-specific (Instagram, Facebook, etc.)`);
+        }
       }
     }
 
@@ -291,15 +325,37 @@ app.post("/ghl-webhook", async (req, res) => {
 
   } catch (err) {
     console.error("[CLAUDE] Error:", err.status, JSON.stringify(err.error || err.message));
+    // ⚠️ Do NOT send a generic greeting here — that's what caused the duplicate-greeting bug.
+    // If we can't generate a real reply, stay silent and escalate. A human will pick it up.
     try {
-      const fallback = `Hi! ${client.botName} here from ${client.shopName} — what can I help you with today?`;
-      await ghl.sendMessage(client.ghlApiKey, contactId, fallback, client.ghlLocationId, outboundType);
-      console.log("[FALLBACK] Sent fallback message");
-    } catch (fallbackErr) {
-      console.error("[FALLBACK] Failed to send fallback:", fallbackErr.message);
+      await ghl.addTag(client.ghlApiKey, contactId, ["bot-error", "needs-human"]);
+      const ownerPhone = client.escalationPhone || client.notificationPhone;
+      if (ownerPhone) {
+        await ghl.sendSMSToPhone(
+          client.ghlApiKey,
+          client.ghlLocationId,
+          ownerPhone,
+          `🤖 Bot error — couldn't reply to contact ${contactId} on ${outboundType}. Last msg: "${cleanText.slice(0, 100)}". Manual reply needed.`
+        );
+      }
+      console.log("[FALLBACK] Tagged contact and notified owner — staying silent to customer (no greeting spam)");
+    } catch (escErr) {
+      console.error("[FALLBACK] Failed to escalate after Claude error:", escErr.message);
     }
   }
 });
+
+// ─── Similarity helper for dedup guard (Jaccard on lowercased word sets) ─────
+function similarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const wa = new Set(String(a).toLowerCase().match(/\w+/g) || []);
+  const wb = new Set(String(b).toLowerCase().match(/\w+/g) || []);
+  if (wa.size === 0 && wb.size === 0) return 1;
+  const inter = new Set([...wa].filter(x => wb.has(x))).size;
+  const union = new Set([...wa, ...wb]).size;
+  return union === 0 ? 0 : inter / union;
+}
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
