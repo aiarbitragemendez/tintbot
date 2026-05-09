@@ -126,6 +126,18 @@ async function addTag(apiKey, contactId, tags) {
   return res.data;
 }
 
+async function removeTag(apiKey, contactId, tags) {
+  const tagList = Array.isArray(tags) ? tags : [tags];
+  const res = await axios.delete(
+    `${BASE}/contacts/${contactId}/tags`,
+    {
+      headers: v2Headers(apiKey),
+      data: { tags: tagList },
+    }
+  );
+  return res.data;
+}
+
 async function triggerWorkflow(apiKey, contactId, workflowId) {
   const res = await axios.post(
     `${BASE}/contacts/${contactId}/workflow/${workflowId}`,
@@ -308,6 +320,7 @@ module.exports = {
   addToPipeline,
   addNote,
   addTag,
+  removeTag,
   triggerWorkflow,
   sendMessage,
   getConversationMessages,

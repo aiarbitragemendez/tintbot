@@ -186,6 +186,63 @@ app.post("/ghl-webhook", async (req, res) => {
   session._lastChannel = outboundType;
   console.log(`[SESSION] in-memory msgs=${session.messages.length} | escalated=${session.escalated} | escSent=${session.escalationMessageSent}`);
 
+  // ── Fetch fresh GHL tags — this is the single source of truth for escalation state ──
+  // We do this on every inbound so Railway restarts don't lose escalation state.
+  let isBotErrorRetry = false;
+  if (client.ghlApiKey) {
+    let rawTags = [];
+    try {
+      rawTags = await ghl.getContactTags(client.ghlApiKey, contactId);
+      session._cachedTags = rawTags; // keep in sync for downstream use
+    } catch (e) {
+      console.error("[ESCALATION] Could not fetch contact tags:", e.message);
+    }
+
+    const tags = rawTags.map(t => String(t).toLowerCase());
+    const hasReturnToBot = tags.includes("return-to-bot");
+    const hasNeedsHuman  = tags.includes("needs-human");
+    const hasBotError    = tags.includes("bot-error");
+
+    console.log(`[ESCALATION] Tags: needs-human=${hasNeedsHuman}, bot-error=${hasBotError}, return-to-bot=${hasReturnToBot}`);
+
+    if (hasReturnToBot) {
+      // Staff has handed the contact back — clear all escalation tags and resume
+      console.log("[ESCALATION] Tags: return-to-bot=true → CLEARING TAGS, RESUMING BOT");
+      try {
+        const tagsToRemove = ["return-to-bot", "needs-human", "bot-error"].filter(t => tags.includes(t));
+        if (tagsToRemove.length > 0) {
+          await ghl.removeTag(client.ghlApiKey, contactId, tagsToRemove);
+          console.log("[ESCALATION] Removed tags:", tagsToRemove.join(", "));
+        }
+      } catch (e) {
+        console.error("[ESCALATION] Failed to remove escalation tags:", e.message);
+      }
+      // Reset in-memory flags so this session behaves normally again
+      session.escalated = false;
+      session.escalationMessageSent = false;
+      session._escalationSynced = false;
+      session._cachedTags = [];
+    } else if (hasNeedsHuman) {
+      // Real escalation — stay silent regardless of bot-error state
+      console.log(`[ESCALATION] Tags: needs-human=true, bot-error=${hasBotError}, return-to-bot=false → STAYING SILENT`);
+      return;
+    } else if (hasBotError) {
+      // Transient error from a prior outage — retry this message
+      console.log("[ESCALATION] Tags: bot-error=true → RETRYING (transient error tag)");
+      isBotErrorRetry = true;
+      // Sync in-memory state so in-memory guards don't double-silence this contact
+      session.escalated = false;
+      session.escalationMessageSent = false;
+    } else {
+      // No escalation tags — normal flow; keep in-memory flags in sync with GHL reality
+      if (session.escalated) {
+        console.log("[ESCALATION] In-memory escalated=true but no GHL tags found — resetting (likely a stale flag)");
+        session.escalated = false;
+        session.escalationMessageSent = false;
+      }
+    }
+  }
+
   // ── Load GHL conversation history FIRST so all guards below have full context ──
   if (!session.historyLoaded && client.ghlApiKey) {
     session.historyLoaded = true;
@@ -247,18 +304,7 @@ app.post("/ghl-webhook", async (req, res) => {
     }
   }
 
-  // ── Silence logic: if escalated and message sent, only respond to simple FAQs ──
-  if (session.escalated && session.escalationMessageSent) {
-    const lcText = cleanText.toLowerCase();
-    const botCanAnswer = /\b(price|cost|how much|hours|open|location|address|how long|what film|darkness|percent|%)\b/.test(lcText);
-    if (!botCanAnswer) {
-      console.log("[ESCALATION] Session escalated — staying silent");
-      return;
-    }
-    console.log("[ESCALATION] Customer asked a simple FAQ — responding despite escalation");
-  }
-
-  // (history was loaded above, before all guards)
+  // (history was loaded above, before all guards; GHL tag check above replaces old in-memory silence logic)
 
   // Add the new inbound message (with timestamp for dedup logic)
   session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
@@ -296,7 +342,17 @@ app.post("/ghl-webhook", async (req, res) => {
 
     session.messages.push({ role: "assistant", content: String(reply), _ts: Date.now() });
 
-    // Detect if this reply is an escalation message
+    // If this was a bot-error retry and Claude succeeded, clear the tag automatically
+    if (isBotErrorRetry) {
+      try {
+        await ghl.removeTag(client.ghlApiKey, contactId, ["bot-error"]);
+        console.log("[ESCALATION] bot-error tag cleared — Claude recovered successfully");
+      } catch (e) {
+        console.error("[ESCALATION] Failed to remove bot-error tag after recovery:", e.message);
+      }
+    }
+
+    // Detect if this reply is an escalation message (Claude chose to escalate)
     const isEscalationReply = /specialist|reach out shortly|someone will reach out|forward you/i.test(reply);
     if (isEscalationReply && !session.escalationMessageSent) {
       session.escalationMessageSent = true;
@@ -325,22 +381,29 @@ app.post("/ghl-webhook", async (req, res) => {
 
   } catch (err) {
     console.error("[CLAUDE] Error:", err.status, JSON.stringify(err.error || err.message));
-    // ⚠️ Do NOT send a generic greeting here — that's what caused the duplicate-greeting bug.
-    // If we can't generate a real reply, stay silent and escalate. A human will pick it up.
+    // ⚠️ Do NOT send a generic greeting — that caused the duplicate-greeting bug.
+    // Tag bot-error only (NOT needs-human) — this is a transient/recoverable failure.
+    // The contact will be retried automatically on next inbound message.
+    // needs-human is reserved for intentional human handoffs (complaints, complex vehicles, etc.)
     try {
-      await ghl.addTag(client.ghlApiKey, contactId, ["bot-error", "needs-human"]);
-      const ownerPhone = client.escalationPhone || client.notificationPhone;
-      if (ownerPhone) {
-        await ghl.sendSMSToPhone(
-          client.ghlApiKey,
-          client.ghlLocationId,
-          ownerPhone,
-          `🤖 Bot error — couldn't reply to contact ${contactId} on ${outboundType}. Last msg: "${cleanText.slice(0, 100)}". Manual reply needed.`
-        );
+      await ghl.addTag(client.ghlApiKey, contactId, ["bot-error"]);
+      console.log("[FALLBACK] Tagged contact with bot-error (recoverable) — staying silent to customer");
+      // Only notify owner if this is NOT already a known retry (avoid alert spam during outages)
+      if (!isBotErrorRetry) {
+        const ownerPhone = client.escalationPhone || client.notificationPhone;
+        if (ownerPhone) {
+          await ghl.sendSMSToPhone(
+            client.ghlApiKey,
+            client.ghlLocationId,
+            ownerPhone,
+            `🤖 TintBot API error — contact ${contactId} on ${outboundType} could not get a reply.\nLast msg: "${cleanText.slice(0, 120)}"\nTag is bot-error (auto-retries on next message). No action needed unless outage persists.`
+          );
+        }
+      } else {
+        console.log("[FALLBACK] Skipping owner alert — this was already a retry (avoiding alert spam)");
       }
-      console.log("[FALLBACK] Tagged contact and notified owner — staying silent to customer (no greeting spam)");
     } catch (escErr) {
-      console.error("[FALLBACK] Failed to escalate after Claude error:", escErr.message);
+      console.error("[FALLBACK] Failed to apply bot-error tag:", escErr.message);
     }
   }
 });
@@ -392,12 +455,14 @@ async function syncData(session, client, userMessage, botReply) {
   "tintPackage": "Standard Ceramic or Nano-Ceramic or null",
   "appointmentTime": "ISO 8601 datetime or null",
   "isEscalation": false,
+  "escalationReason": null,
   "isReadyToBook": false
 }
 Today is ${new Date().toISOString()}. Timezone is Miami FL (ET).
 Convert relative days/times (e.g. "Friday at 10am") to ISO 8601.
 Set isReadyToBook=true only if customer confirmed a specific day AND time.
-Set isEscalation=true if customer mentions: same-day, luxury/exotic vehicle, fleet, van, complaint, wants a human.
+Set isEscalation=true if customer mentions: same-day appointment, luxury or exotic vehicle over $80k, Tesla Model X, Cybertruck, fleet (2+ vehicles), work van, ProMaster, Sprinter, Transit, complaint about previous work, wants a human or owner.
+When isEscalation=true set escalationReason to a short phrase describing why (e.g. "same-day request", "Tesla Model X", "fleet inquiry", "complaint", "wants human").
 Customer said: "${userMessage}"
 Bot replied: "${botReply}"
 Already known: ${JSON.stringify(data)}`
@@ -521,13 +586,16 @@ Already known: ${JSON.stringify(data)}`
   if (extracted.isEscalation && !session._escalationSynced) {
     session._escalationSynced = true;
     session.escalated = true;
-    console.log("[ESCALATION] Flagging escalation for contact:", ghlContactId);
+    const escalationReason = extracted.escalationReason || "unspecified";
+    console.log("[ESCALATION] Flagging escalation for contact:", ghlContactId, "| Reason:", escalationReason);
     try {
+      // needs-human = intentional human handoff (NOT bot-error)
       await ghl.addTag(client.ghlApiKey, ghlContactId, ["escalated", "needs-human"]);
+      const vehicle = [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown";
       await ghl.addNote(
         client.ghlApiKey,
         ghlContactId,
-        `Bot escalated this conversation.\nCustomer said: "${userMessage}"\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}`
+        `Bot escalated this conversation.\nReason: ${escalationReason}\nCustomer said: "${userMessage}"\nVehicle: ${vehicle}\nName: ${data.name || "Unknown"}\nPhone: ${data.phone || "Unknown"}`
       );
       if (client.ghlEscalationWorkflowId) {
         await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlEscalationWorkflowId);
@@ -536,17 +604,22 @@ Already known: ${JSON.stringify(data)}`
       // Send SMS notification to shop owner (once per conversation)
       const ownerPhone = client.escalationPhone || client.notificationPhone;
       if (ownerPhone && !session.escalationMessageSent) {
-        const vehicle = [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown";
-        const notifMsg =
-          `🚨 New lead needs follow-up from ${data.name || "Unknown"} at ${data.phone || "Unknown"}. ` +
-          `Vehicle: ${vehicle}. ` +
-          `Reason: ${userMessage}. ` +
-          `Last message: ${userMessage}`;
+        const contactLink = `https://app.gohighlevel.com/v2/location/${client.ghlLocationId}/contacts/detail/${ghlContactId}`;
+        const notifMsg = [
+          `🚨 TintBot Escalation — action needed`,
+          `Name: ${data.name || "Unknown"}`,
+          `Phone: ${data.phone || "Unknown"}`,
+          `Vehicle: ${vehicle}`,
+          `Reason: ${escalationReason}`,
+          `Last msg: "${userMessage.slice(0, 120)}"`,
+          `GHL: ${contactLink}`,
+          `→ Reply or handle in GHL. Add tag return-to-bot when ready to hand back to Camila.`,
+        ].join("\n");
         await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
         session.escalationMessageSent = true;
         console.log("[ESCALATION] Owner notification sent to:", ownerPhone);
       } else if (session.escalationMessageSent) {
-        console.log("[ESCALATION] Owner notification already sent — skipping");
+        console.log("[ESCALATION] Owner notification already sent this session — skipping");
       }
     } catch (e) {
       console.error("[ESCALATION] Error:", e.message);
