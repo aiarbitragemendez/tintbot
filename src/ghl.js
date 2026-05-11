@@ -147,7 +147,7 @@ async function triggerWorkflow(apiKey, contactId, workflowId) {
   return res.data;
 }
 
-async function sendMessage(apiKey, contactId, message, locationId, type = "SMS") {
+async function sendMessage(apiKey, contactId, message, locationId, type = "SMS", opts = {}) {
   const headers = v2Headers(apiKey);
 
   const searchUrl = locationId
@@ -157,7 +157,6 @@ async function sendMessage(apiKey, contactId, message, locationId, type = "SMS")
   let conversationId;
   try {
     const convResponse = await axios.get(searchUrl, { headers });
-    console.log("[GHL] Conversations found:", JSON.stringify(convResponse.data));
     const conversations = convResponse.data?.conversations;
     if (conversations && conversations.length > 0) {
       conversationId = conversations[0].id;
@@ -178,13 +177,48 @@ async function sendMessage(apiKey, contactId, message, locationId, type = "SMS")
     console.log("[GHL] Created new conversation:", conversationId);
   }
 
-  console.log(`[GHL] Sending message via channel: ${type}`);
-  const res = await axios.post(
-    `${BASE}/conversations/messages`,
-    { type, message, conversationId, contactId },
-    { headers }
+  // Build channel-appropriate payload
+  const payload = { type, conversationId, contactId };
+
+  if (type === "Email") {
+    payload.subject = opts.subject || "Reply from Dr. Tints";
+    payload.html    = opts.html    || `<p>${String(message).replace(/\n/g, "<br>")}</p>`;
+    payload.message = message; // text fallback
+    if (opts.fromEmail) payload.emailFrom = opts.fromEmail;
+  } else {
+    payload.message = message;
+  }
+
+  console.log(`[GHL] Sending message via channel: ${type} (conv=${conversationId})`);
+  try {
+    const res = await axios.post(
+      `${BASE}/conversations/messages`,
+      payload,
+      { headers, validateStatus: () => true }
+    );
+    if (res.status < 200 || res.status >= 300) {
+      const safePayload = { ...payload };
+      if (safePayload.html) safePayload.html = `[${safePayload.html.length} chars]`;
+      console.error(`[GHL] Send failed status=${res.status} body=${JSON.stringify(res.data)} payload=${JSON.stringify(safePayload)}`);
+      const err = new Error(`GHL send failed status ${res.status}`);
+      err.status = res.status;
+      err.response = { status: res.status, data: res.data };
+      throw err;
+    }
+    return res.data;
+  } catch (e) {
+    if (!e.response) console.error("[GHL] Send network error:", e.message);
+    throw e;
+  }
+}
+
+// Verify a Private Integration token can read a location (used at startup)
+async function verifyLocationAccess(apiKey, locationId) {
+  const res = await axios.get(
+    `${BASE}/locations/${locationId}`,
+    { headers: v2Headers(apiKey), validateStatus: () => true }
   );
-  return res.data;
+  return { ok: res.status >= 200 && res.status < 300, status: res.status, body: res.data };
 }
 
 // Fetch last N messages from GHL conversation and convert to Claude message format
@@ -326,4 +360,5 @@ module.exports = {
   getConversationMessages,
   getContactTags,
   sendSMSToPhone,
+  verifyLocationAccess,
 };

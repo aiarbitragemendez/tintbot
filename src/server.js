@@ -39,6 +39,52 @@ app.use(express.json());
 // ─── Session store ────────────────────────────────────────────────────────────
 const sessions = new Map();
 
+// ─── Webhook-level dedup (prevents double-replies if GHL fires same msg twice) ─
+const recentMessageIds = new Map(); // messageId -> timestamp
+const MSG_DEDUP_TTL_MS = 5 * 60 * 1000;
+function isDuplicateWebhook(msgId) {
+  if (!msgId) return false;
+  const now = Date.now();
+  // Sweep stale entries (cheap, runs occasionally)
+  if (recentMessageIds.size > 500) {
+    for (const [k, ts] of recentMessageIds) {
+      if (now - ts > MSG_DEDUP_TTL_MS) recentMessageIds.delete(k);
+    }
+  }
+  if (recentMessageIds.has(msgId)) {
+    const age = now - recentMessageIds.get(msgId);
+    if (age < MSG_DEDUP_TTL_MS) return true;
+  }
+  recentMessageIds.set(msgId, now);
+  return false;
+}
+
+// ─── GHL numeric "type" field → channel string mapping ────────────────────────
+// GHL webhooks sometimes send `type` as a number instead of a string.
+// Source: GHL Conversations API — message types.
+const NUMERIC_TYPE_MAP = {
+  1:  "Call",
+  2:  "SMS",
+  3:  "Email",
+  24: "FB",         // Facebook Messenger
+  25: "IG",         // Instagram DM
+  26: "WhatsApp",
+  27: "Live_Chat",
+  28: "Custom",
+  29: "GMB",        // Google My Business
+  30: "Review",
+};
+
+// ─── Trace logger — tagged 8-stage log per inbound webhook ───────────────────
+let _traceCounter = 0;
+function newTraceId() {
+  _traceCounter = (_traceCounter + 1) % 100000;
+  return `t${Date.now().toString(36).slice(-5)}-${_traceCounter}`;
+}
+function trace(traceId, stage, msg) {
+  console.log(`[${traceId}][${stage}] ${msg}`);
+}
+
 function getSession(contactId, clientId) {
   const key = `${clientId}:${contactId}`;
   if (!sessions.has(key)) {
@@ -105,97 +151,118 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ─── /ghl-webhook endpoint (SMS via GHL) ─────────────────────────────────────
+// ─── /ghl-webhook endpoint — every inbound message from every channel ────────
 app.post("/ghl-webhook", async (req, res) => {
   res.sendStatus(200);
   const body = req.body;
-  console.log("[WEBHOOK] Received:", JSON.stringify(body));
+  const t0 = Date.now();
+  const traceId = newTraceId();
 
-  // Skip outbound (messages we sent)
-  if (body.direction === "outbound") {
-    console.log("[WEBHOOK] Skipping outbound message");
+  // ── Direction check (skip outbound — don't reply to ourselves) ────────────
+  // GHL fires webhooks for BOTH directions. Numeric `type` fields can also
+  // indicate direction (some payloads use type=1 for outbound, type=2 for SMS
+  // inbound). The authoritative field is `direction`.
+  const direction = (body.direction || "inbound").toLowerCase();
+  if (direction === "outbound") {
+    trace(traceId, "1/8 INBOUND", `direction=outbound — IGNORING (our own send)`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=OUTBOUND_ECHO_IGNORED`);
     return;
   }
 
-  // Match client by locationId
-  const locationId = body.locationId || body.location_id || (body.location && body.location.id);
-  console.log("[WEBHOOK] Location ID:", locationId);
-
-  const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
-  if (!client) {
-    console.warn("[WEBHOOK] No client matched locationId:", locationId);
-    return;
+  // ── Channel detection — accept ALL channels (string OR numeric type) ─────
+  const rawType = body.type ?? body.messageType ?? body.channel ?? "SMS";
+  let channelStr;
+  if (typeof rawType === "number" && NUMERIC_TYPE_MAP[rawType]) {
+    channelStr = NUMERIC_TYPE_MAP[rawType];
+  } else {
+    channelStr = String(rawType);
   }
-  console.log("[WEBHOOK] Matched client:", client.clientId);
+  const cLow = channelStr.toLowerCase();
 
-  // Extract message and contactId
+  let outboundType = "SMS";
+  if (cLow.includes("instagram") || cLow === "ig") outboundType = "IG";
+  else if (cLow.includes("facebook") || cLow.includes("messenger") || cLow === "fb") outboundType = "FB";
+  else if (cLow.includes("whatsapp") || cLow === "wa") outboundType = "WhatsApp";
+  else if (cLow.includes("email")) outboundType = "Email";
+  else if (cLow.includes("live") || cLow.includes("chat")) outboundType = "Live_Chat";
+  else if (cLow.includes("gmb") || cLow.includes("google")) outboundType = "GMB";
+  else if (cLow.includes("custom")) outboundType = "Custom";
+  else if (cLow.includes("sms")) outboundType = "SMS";
+  else {
+    trace(traceId, "1/8 INBOUND", `⚠️ Unknown channel "${channelStr}" (raw type=${JSON.stringify(rawType)}) — defaulting to SMS`);
+  }
+
+  // ── Extract message body and contactId ───────────────────────────────────
   const inboundText = (
     (body.message && body.message.body) ||
-    body.message ||
+    (typeof body.message === "string" ? body.message : null) ||
     body.body ||
     body.text ||
+    body["Your Message"] ||
     ""
   );
   const contactId = body.contactId || body.contact_id || null;
+  const messageId = body.messageId || body.id || (body.message && body.message.id) || null;
+
+  // Pull tags upfront so log line is informative
+  const inlineTags = Array.isArray(body.tags) ? body.tags.map(String) : [];
+
+  trace(traceId, "1/8 INBOUND",
+    `channel=${outboundType}(raw=${JSON.stringify(rawType)}) | direction=${direction} | ` +
+    `contact=${contactId || "MISSING"} | msgId=${messageId || "none"} | ` +
+    `body="${String(inboundText).slice(0, 120)}" | tags=[${inlineTags.join(",")}]`);
+
+  // ── Webhook-level dedup ──────────────────────────────────────────────────
+  if (isDuplicateWebhook(messageId)) {
+    trace(traceId, "1/8 INBOUND", `🚫 DUPLICATE webhook (messageId=${messageId} seen recently) — IGNORING`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=DUPLICATE_WEBHOOK`);
+    return;
+  }
 
   if (!inboundText || typeof inboundText !== "string" || inboundText.trim() === "") {
-    console.warn("[WEBHOOK] Empty or invalid message — skipping");
+    trace(traceId, "1/8 INBOUND", `🚫 Empty or invalid body — RAW: ${JSON.stringify(body).slice(0, 400)}`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=EMPTY_BODY`);
     return;
   }
   if (!contactId) {
-    console.warn("[WEBHOOK] Missing contactId — skipping");
+    trace(traceId, "1/8 INBOUND", `🚫 Missing contactId — RAW: ${JSON.stringify(body).slice(0, 400)}`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=MISSING_CONTACT_ID`);
     return;
   }
 
+  // ── Match client by locationId ───────────────────────────────────────────
+  const locationId = body.locationId || body.location_id || (body.location && body.location.id);
+  const client = Object.values(clients).find(c => c.ghlLocationId === locationId);
+  if (!client) {
+    const known = Object.values(clients).map(c => `${c.clientId}=${c.ghlLocationId}`).join(", ");
+    trace(traceId, "2/8 CLIENT-MATCH", `❌ NO MATCH for locationId="${locationId}" | known: [${known}]`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=NO_CLIENT_MATCH`);
+    return;
+  }
+  trace(traceId, "2/8 CLIENT-MATCH", `location=${locationId} → client=${client.clientId}`);
+
   const cleanText = inboundText.trim();
-
-  // ── Detect inbound channel — accept ALL channels ─────────────────────────
-  const inboundChannel = body.type || body.messageType || body.channel || "SMS";
-  const channelStr = String(inboundChannel).toLowerCase();
-
-  const isSMS = channelStr.includes("sms");
-  const isIG = channelStr.includes("ig") || channelStr.includes("instagram");
-  const isFB = channelStr.includes("fb") || channelStr.includes("facebook") || channelStr.includes("messenger");
-  const isLiveChat = channelStr.includes("live") || channelStr.includes("chat");
-  const isEmail = channelStr.includes("email");
-  const isGMB = channelStr.includes("gmb") || channelStr.includes("google");
-  const isWhatsApp = channelStr.includes("whatsapp") || channelStr.includes("wa");
-  const isCustom = channelStr.includes("custom");
-
-  // Outbound `type` for GHL conversations/messages must match inbound
-  let outboundType = "SMS";
-  if (isIG) outboundType = "IG";
-  else if (isFB) outboundType = "FB";
-  else if (isGMB) outboundType = "GMB";
-  else if (isEmail) outboundType = "Email";
-  else if (isLiveChat) outboundType = "Live_Chat";
-  else if (isWhatsApp) outboundType = "WhatsApp";
-  else if (isCustom) outboundType = "Custom";
-  else if (isSMS) outboundType = "SMS";
-  else console.warn(`[WEBHOOK] Unknown channel "${inboundChannel}" — defaulting outbound to SMS`);
-
-  console.log(`[WEBHOOK] 📨 channel="${inboundChannel}" → outbound="${outboundType}" | contact=${contactId} | msg="${cleanText.slice(0, 100)}"`);
 
   // STOP / opt-out keywords are handled by GHL natively — just log and exit
   if (/^(stop|stopall|unsubscribe|cancel|end|quit)$/i.test(cleanText)) {
-    console.log(`[WEBHOOK] 🛑 Opt-out keyword detected ("${cleanText}") — GHL handles compliance, skipping bot reply`);
+    trace(traceId, "3/8 ESCALATION-CHECK", `🛑 Opt-out keyword "${cleanText}" — GHL handles compliance, NOT REPLYING`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=OPT_OUT_KEYWORD`);
     return;
   }
 
   const session = getSession(contactId, client.clientId);
   session._lastChannel = outboundType;
-  console.log(`[SESSION] in-memory msgs=${session.messages.length} | escalated=${session.escalated} | escSent=${session.escalationMessageSent}`);
 
-  // ── Fetch fresh GHL tags — this is the single source of truth for escalation state ──
-  // We do this on every inbound so Railway restarts don't lose escalation state.
+  // ── Fetch fresh GHL tags — single source of truth for escalation state ────
   let isBotErrorRetry = false;
+  let decision = "PROCEED";
   if (client.ghlApiKey) {
     let rawTags = [];
     try {
       rawTags = await ghl.getContactTags(client.ghlApiKey, contactId);
-      session._cachedTags = rawTags; // keep in sync for downstream use
+      session._cachedTags = rawTags;
     } catch (e) {
-      console.error("[ESCALATION] Could not fetch contact tags:", e.message);
+      trace(traceId, "3/8 ESCALATION-CHECK", `⚠️ Could not fetch contact tags: ${e.message} — proceeding without tag info`);
     }
 
     const tags = rawTags.map(t => String(t).toLowerCase());
@@ -203,120 +270,93 @@ app.post("/ghl-webhook", async (req, res) => {
     const hasNeedsHuman  = tags.includes("needs-human");
     const hasBotError    = tags.includes("bot-error");
 
-    console.log(`[ESCALATION] Tags: needs-human=${hasNeedsHuman}, bot-error=${hasBotError}, return-to-bot=${hasReturnToBot}`);
-
     if (hasReturnToBot) {
-      // Staff has handed the contact back — clear all escalation tags and resume
-      console.log("[ESCALATION] Tags: return-to-bot=true → CLEARING TAGS, RESUMING BOT");
+      decision = "RESUMING (return-to-bot)";
       try {
         const tagsToRemove = ["return-to-bot", "needs-human", "bot-error"].filter(t => tags.includes(t));
         if (tagsToRemove.length > 0) {
           await ghl.removeTag(client.ghlApiKey, contactId, tagsToRemove);
-          console.log("[ESCALATION] Removed tags:", tagsToRemove.join(", "));
         }
       } catch (e) {
-        console.error("[ESCALATION] Failed to remove escalation tags:", e.message);
+        trace(traceId, "3/8 ESCALATION-CHECK", `⚠️ Failed to remove escalation tags: ${e.message}`);
       }
-      // Reset in-memory flags so this session behaves normally again
       session.escalated = false;
       session.escalationMessageSent = false;
       session._escalationSynced = false;
       session._cachedTags = [];
     } else if (hasNeedsHuman) {
-      // Real escalation — stay silent regardless of bot-error state
-      console.log(`[ESCALATION] Tags: needs-human=true, bot-error=${hasBotError}, return-to-bot=false → STAYING SILENT`);
+      trace(traceId, "3/8 ESCALATION-CHECK",
+        `tags: needs-human=true bot-error=${hasBotError} return-to-bot=false → DECISION: STAYING_SILENT`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=SILENT_BY_DESIGN (needs-human)`);
       return;
     } else if (hasBotError) {
-      // Transient error from a prior outage — retry this message
-      console.log("[ESCALATION] Tags: bot-error=true → RETRYING (transient error tag)");
+      decision = "RETRY (bot-error tag — transient)";
       isBotErrorRetry = true;
-      // Sync in-memory state so in-memory guards don't double-silence this contact
       session.escalated = false;
       session.escalationMessageSent = false;
     } else {
-      // No escalation tags — normal flow; keep in-memory flags in sync with GHL reality
       if (session.escalated) {
-        console.log("[ESCALATION] In-memory escalated=true but no GHL tags found — resetting (likely a stale flag)");
+        decision = "PROCEED (clearing stale in-memory escalated flag)";
         session.escalated = false;
         session.escalationMessageSent = false;
       }
     }
+    trace(traceId, "3/8 ESCALATION-CHECK",
+      `tags: needs-human=${hasNeedsHuman} bot-error=${hasBotError} return-to-bot=${hasReturnToBot} → DECISION: ${decision}`);
+  } else {
+    trace(traceId, "3/8 ESCALATION-CHECK", `no GHL key configured for client → DECISION: PROCEED (skipping tag check)`);
   }
 
-  // ── Load GHL conversation history FIRST so all guards below have full context ──
+  // ── Load GHL conversation history (first inbound after restart) ──────────
+  let historyMsg = `cached (${session.messages.length} msgs in memory)`;
   if (!session.historyLoaded && client.ghlApiKey) {
     session.historyLoaded = true;
-    console.log("[GHL HISTORY] Loading prior conversation for contact:", contactId);
     try {
       const history = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
       if (history.length > 0) {
-        // Stamp loaded history as "old" so the dedup guard never matches against pre-restart messages
         const old = Date.now() - 60 * 60 * 1000;
         session.messages = history.map(m => ({ ...m, _ts: old }));
-        console.log(`[GHL HISTORY] ✅ Seeded session with ${history.length} messages from GHL`);
+        historyMsg = `Fetched ${history.length} messages from GHL`;
       } else {
-        console.log("[GHL HISTORY] No prior messages — fresh conversation");
+        historyMsg = `No prior messages — fresh conversation`;
       }
     } catch (e) {
-      console.error("[GHL HISTORY] Failed to load history:", e.message);
+      historyMsg = `⚠️ history fetch failed: ${e.message} — proceeding with empty context`;
     }
   }
+  trace(traceId, "4/8 HISTORY", historyMsg);
 
-  // ── Cold-confirmation guard: short "yes/ok/no" with no recent bot reply = GHL automation reply ──
-  // Only treat as automation confirmation if BOTH:
-  //   - message ≤ 5 chars after trim
-  //   - no assistant message in the thread (prefer last 10 min, but any prior bot msg also counts as live thread)
-  const trimmedLc = cleanText.trim().toLowerCase();
-  const isShortYesNo = /^(yes|y|yeah|yep|yup|done|ok|okay|k|no|n|nope)[.!\s]*$/i.test(trimmedLc) && trimmedLc.length <= 5;
-
-  if (isShortYesNo) {
-    const hasAnyBotMsg = session.messages.some(m => m.role === "assistant");
-    if (!hasAnyBotMsg) {
-      console.log(`[WEBHOOK] 🚫 SUPPRESSED — short reply "${cleanText}" with no prior bot msg (likely GHL automation confirmation)`);
-      return;
-    }
-    console.log(`[WEBHOOK] ✅ Short reply "${cleanText}" — prior bot message exists, processing in context`);
-  }
-
-  // ── Post-booking short-confirmation filter (existing logic, kept) ──
+  // ── Post-booking short-confirmation filter ──────────────────────────────
   const confirmationPatterns = /^(yes|ok|okay|done|confirmed|thanks|thank you|got it|yep|yeah|sounds good|perfect|k|kk|ty)[.!\s]*$/i;
-  const isShortConfirmation =
-    cleanText.length < 15 && confirmationPatterns.test(cleanText.trim());
+  const isShortConfirmation = cleanText.length < 15 && confirmationPatterns.test(cleanText.trim());
 
   if (isShortConfirmation) {
     if (session.collectedData._appointmentBooked) {
-      console.log("CONFIRMATION REPLY — IGNORED (appointment booked)");
+      trace(traceId, "5/8 CLAUDE", `🚫 SUPPRESSED — short confirmation, appointment already booked this session`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_THANKS`);
       return;
     }
     if (client.ghlApiKey) {
       try {
-        if (!session._cachedTags) {
-          session._cachedTags = await ghl.getContactTags(client.ghlApiKey, contactId);
-        }
         const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
         if (tags.includes("appointment-booked") || tags.includes("confirmed")) {
-          console.log("CONFIRMATION REPLY — IGNORED (tag match)");
+          trace(traceId, "5/8 CLAUDE", `🚫 SUPPRESSED — short confirmation, contact has appointment-booked/confirmed tag`);
+          trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_THANKS_TAG`);
           return;
         }
-      } catch (e) {
-        console.error("[CONFIRMATION] Tag lookup error:", e.message);
-      }
+      } catch (e) { /* tag lookup failures already logged earlier */ }
     }
   }
 
-  // (history was loaded above, before all guards; GHL tag check above replaces old in-memory silence logic)
-
-  // Add the new inbound message (with timestamp for dedup logic)
+  // Add the new inbound message
   session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
 
-  // Build clean context (last 30, validated, alternating)
   const contextMessages = session.messages
     .filter(isValidMessage)
     .slice(-30)
-    .map(({ role, content }) => ({ role, content })); // strip _ts before sending to Claude
+    .map(({ role, content }) => ({ role, content }));
 
-  console.log(`[CLAUDE] Sending ${contextMessages.length} messages | history=${session.messages.length} | Model: ${MODEL}`);
-
+  const claudeStart = Date.now();
   try {
     const response = await anthropic.messages.create({
       model: MODEL,
@@ -324,71 +364,88 @@ app.post("/ghl-webhook", async (req, res) => {
       system: buildSystemPrompt(client),
       messages: contextMessages,
     });
+    const claudeMs = Date.now() - claudeStart;
 
     const reply = response.content[0].text;
-    console.log("[BOT REPLY]:", reply);
+    const usage = response.usage || {};
+    trace(traceId, "5/8 CLAUDE",
+      `Called API with ${contextMessages.length} messages | response=${claudeMs}ms | tokens in=${usage.input_tokens || "?"} out=${usage.output_tokens || "?"}`);
 
-    // ── Deduplication guard: don't re-send identical/near-identical message within 2 min ──
+    // ── Dedup: don't re-send near-identical reply within 2min ─────────────
     const twoMinAgo = Date.now() - 2 * 60 * 1000;
     const lastBot = [...session.messages].reverse().find(m => m.role === "assistant");
     if (lastBot && lastBot._ts && lastBot._ts > twoMinAgo) {
       const sim = similarity(String(lastBot.content), String(reply));
       if (sim >= 0.9) {
-        console.warn(`[DEDUP] 🚫 SUPPRESSED — bot was about to send a ${(sim * 100).toFixed(0)}% match of last msg sent ${Math.round((Date.now() - lastBot._ts) / 1000)}s ago`);
-        console.warn(`[DEDUP] Suppressed text: "${reply}"`);
+        trace(traceId, "6/8 OUTBOUND",
+          `🚫 SUPPRESSED — ${(sim * 100).toFixed(0)}% match of last msg ${Math.round((Date.now() - lastBot._ts) / 1000)}s ago`);
+        trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=DEDUP_SUPPRESSED`);
         return;
       }
     }
 
     session.messages.push({ role: "assistant", content: String(reply), _ts: Date.now() });
 
-    // If this was a bot-error retry and Claude succeeded, clear the tag automatically
     if (isBotErrorRetry) {
       try {
         await ghl.removeTag(client.ghlApiKey, contactId, ["bot-error"]);
-        console.log("[ESCALATION] bot-error tag cleared — Claude recovered successfully");
+        trace(traceId, "5/8 CLAUDE", `bot-error tag cleared — Claude recovered`);
       } catch (e) {
-        console.error("[ESCALATION] Failed to remove bot-error tag after recovery:", e.message);
+        trace(traceId, "5/8 CLAUDE", `⚠️ Failed to remove bot-error tag after recovery: ${e.message}`);
       }
     }
 
-    // Detect if this reply is an escalation message (Claude chose to escalate)
     const isEscalationReply = /specialist|reach out shortly|someone will reach out|forward you/i.test(reply);
     if (isEscalationReply && !session.escalationMessageSent) {
       session.escalationMessageSent = true;
       session.escalated = true;
-      console.log("[ESCALATION] Escalation message sent — future messages will be silenced");
     }
 
     // Send reply via GHL on the same channel the customer used
+    trace(traceId, "6/8 OUTBOUND", `Sending ${outboundType} reply via POST /conversations/messages`);
+    const sendStart = Date.now();
     try {
-      await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
-      console.log(`[GHL] ✅ Sent on channel ${outboundType}`);
+      const sendRes = await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
+      const sentId = sendRes?.messageId || sendRes?.id || sendRes?.message?.id || "unknown";
+      trace(traceId, "6/8 OUTBOUND", `✅ Sent | messageId=${sentId} | took=${Date.now() - sendStart}ms`);
     } catch (sendErr) {
-      console.error("[GHL] Send error:", sendErr.message);
+      trace(traceId, "6/8 OUTBOUND",
+        `❌ Send failed on channel ${outboundType} | status=${sendErr.response?.status || "?"} | err=${sendErr.message}`);
       if (sendErr.response) {
-        console.error("[GHL] Send error details:", JSON.stringify(sendErr.response.data));
+        trace(traceId, "6/8 OUTBOUND", `   response body: ${JSON.stringify(sendErr.response.data).slice(0, 400)}`);
         if (sendErr.response.status === 401 || sendErr.response.status === 403) {
-          console.error(`[GHL] ⚠️ AUTH ERROR sending on ${outboundType} — Private Integration token may be missing scopes for this channel. Check: conversations.write, conversations/message.write, plus channel-specific (Instagram, Facebook, etc.)`);
+          trace(traceId, "6/8 OUTBOUND",
+            `⚠️ AUTH ERROR — Private Integration token may be missing scopes for ${outboundType}. ` +
+            `Need: conversations.write, conversations/message.write, plus channel-specific (instagram/messenger/whatsapp/email).`);
         }
       }
+      // Notify owner once per failure spike (best-effort)
+      try {
+        const ownerPhone = client.escalationPhone || client.notificationPhone;
+        if (ownerPhone && !isBotErrorRetry) {
+          await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone,
+            `🤖 TintBot send-fail on ${outboundType} for contact ${contactId}. Status=${sendErr.response?.status || "?"}.`);
+        }
+      } catch (notifyErr) { /* swallow notify errors */ }
     }
+
+    trace(traceId, "7/8 STAFF-NOTIFY", `not needed (normal reply)`);
 
     // Async data extraction and GHL sync
     syncData(session, client, cleanText, reply).catch(e =>
-      console.error("[SYNC] Unhandled error:", e.message)
+      console.error(`[${traceId}][SYNC] Unhandled error:`, e.message)
     );
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=REPLIED`);
 
   } catch (err) {
-    console.error("[CLAUDE] Error:", err.status, JSON.stringify(err.error || err.message));
-    // ⚠️ Do NOT send a generic greeting — that caused the duplicate-greeting bug.
-    // Tag bot-error only (NOT needs-human) — this is a transient/recoverable failure.
-    // The contact will be retried automatically on next inbound message.
-    // needs-human is reserved for intentional human handoffs (complaints, complex vehicles, etc.)
+    trace(traceId, "5/8 CLAUDE", `❌ Claude API error | status=${err.status || "?"} | err=${JSON.stringify(err.error || err.message)}`);
+
+    // Tag bot-error (recoverable) — auto-retries on next inbound msg
+    let staffNotified = false;
     try {
       await ghl.addTag(client.ghlApiKey, contactId, ["bot-error"]);
-      console.log("[FALLBACK] Tagged contact with bot-error (recoverable) — staying silent to customer");
-      // Only notify owner if this is NOT already a known retry (avoid alert spam during outages)
+      trace(traceId, "6/8 OUTBOUND", `Skipped (Claude failed) — tagged bot-error for auto-retry`);
+
       if (!isBotErrorRetry) {
         const ownerPhone = client.escalationPhone || client.notificationPhone;
         if (ownerPhone) {
@@ -398,13 +455,14 @@ app.post("/ghl-webhook", async (req, res) => {
             ownerPhone,
             `🤖 TintBot API error — contact ${contactId} on ${outboundType} could not get a reply.\nLast msg: "${cleanText.slice(0, 120)}"\nTag is bot-error (auto-retries on next message). No action needed unless outage persists.`
           );
+          staffNotified = true;
         }
-      } else {
-        console.log("[FALLBACK] Skipping owner alert — this was already a retry (avoiding alert spam)");
       }
     } catch (escErr) {
-      console.error("[FALLBACK] Failed to apply bot-error tag:", escErr.message);
+      trace(traceId, "6/8 OUTBOUND", `❌ Failed to apply bot-error tag: ${escErr.message}`);
     }
+    trace(traceId, "7/8 STAFF-NOTIFY", staffNotified ? `owner alerted via SMS` : `skipped (retry or no owner phone)`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=BOT_ERROR_TAGGED`);
   }
 });
 
@@ -627,11 +685,66 @@ Already known: ${JSON.stringify(data)}`
   }
 }
 
+// ─── Startup self-check ──────────────────────────────────────────────────────
+async function startupSelfCheck() {
+  console.log("\n" + "═".repeat(72));
+  console.log("[STARTUP] TintBot self-check");
+  console.log("═".repeat(72));
+
+  const clientIds = Object.keys(clients);
+  console.log(`[STARTUP] Loaded clients: [${clientIds.join(", ") || "NONE"}]`);
+  if (clientIds.length === 0) {
+    console.error("[STARTUP] ❌ No clients loaded — bot will silently ignore every webhook!");
+  }
+
+  for (const cid of clientIds) {
+    const c = clients[cid];
+    console.log(`[STARTUP] ${cid} config: name="${c.shopName}" persona="${c.botName}" location=${c.ghlLocationId} calendar=${c.ghlCalendarId || "(none)"}`);
+  }
+
+  console.log(`[STARTUP] Anthropic API key present: ${!!process.env.ANTHROPIC_API_KEY} | model=${MODEL}`);
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("[STARTUP] ❌ ANTHROPIC_API_KEY is missing — every reply will fail and contacts will be tagged bot-error");
+  }
+
+  for (const cid of clientIds) {
+    const c = clients[cid];
+    const haveKey = !!c.ghlApiKey;
+    console.log(`[STARTUP] ${cid} GHL token present: ${haveKey}${haveKey ? " | testing token..." : ""}`);
+    if (!haveKey) {
+      console.error(`[STARTUP] ❌ ${cid}: missing ghlApiKey — bot cannot read tags or send replies for this client`);
+      continue;
+    }
+    try {
+      const result = await ghl.verifyLocationAccess(c.ghlApiKey, c.ghlLocationId);
+      if (result.ok) {
+        console.log(`[STARTUP] ${cid} GHL token test: ✅ valid (location accessible, status ${result.status})`);
+      } else {
+        console.error(`[STARTUP] ${cid} GHL token test: ❌ FAILED status=${result.status} body=${JSON.stringify(result.body).slice(0, 250)}`);
+        if (result.status === 401 || result.status === 403) {
+          console.error(`[STARTUP] ${cid} ⚠️ token is invalid or missing scopes. Required scopes:`);
+          console.error(`[STARTUP] ${cid}    locations.readonly, contacts.readonly, contacts.write,`);
+          console.error(`[STARTUP] ${cid}    conversations.readonly, conversations.write,`);
+          console.error(`[STARTUP] ${cid}    conversations/message.readonly, conversations/message.write,`);
+          console.error(`[STARTUP] ${cid}    calendars.readonly, calendars.write, calendars/events.write`);
+        }
+      }
+    } catch (e) {
+      console.error(`[STARTUP] ${cid} GHL token test: ❌ EXCEPTION ${e.message}`);
+    }
+  }
+
+  console.log(`[STARTUP] Channels enabled (server-side): SMS, IG, FB, WhatsApp, Email, Live_Chat, GMB, Custom`);
+  console.log(`[STARTUP] Webhook endpoint ready at /ghl-webhook`);
+  console.log("═".repeat(72) + "\n");
+}
+
 // ─── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`\nTintBot running on port ${PORT}`);
   console.log(`Model: ${MODEL}`);
   console.log(`Clients loaded: ${Object.keys(clients).join(", ")}`);
+  await startupSelfCheck();
   console.log(`Ready.\n`);
 });
