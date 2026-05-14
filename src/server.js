@@ -326,25 +326,19 @@ app.post("/ghl-webhook", async (req, res) => {
   }
   trace(traceId, "4/8 HISTORY", historyMsg);
 
-  // ── Post-booking short-confirmation filter ──────────────────────────────
-  const confirmationPatterns = /^(yes|ok|okay|done|confirmed|thanks|thank you|got it|yep|yeah|sounds good|perfect|k|kk|ty)[.!\s]*$/i;
-  const isShortConfirmation = cleanText.length < 15 && confirmationPatterns.test(cleanText.trim());
-
-  if (isShortConfirmation) {
-    if (session.collectedData._appointmentBooked) {
-      trace(traceId, "5/8 CLAUDE", `🚫 SUPPRESSED — short confirmation, appointment already booked this session`);
-      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_THANKS`);
+  // ── Post-booking total silence ──────────────────────────────────────────
+  // Once a contact has a booked appointment, the bot stops replying to ANY
+  // inbound. Owner handles deposits, reschedules, and service questions manually.
+  // Triggers: in-session booking flag OR GHL tag `appointment-booked`/`confirmed`.
+  {
+    const sessionBooked = session.collectedData._appointmentBooked === true;
+    const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
+    const tagBooked = tags.includes("appointment-booked") || tags.includes("confirmed");
+    if (sessionBooked || tagBooked) {
+      trace(traceId, "5/8 CLAUDE",
+        `🚫 POST-BOOKING SILENCE — session=${sessionBooked} tag=${tagBooked} | inbound="${cleanText.slice(0, 80)}"`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_SILENCE`);
       return;
-    }
-    if (client.ghlApiKey) {
-      try {
-        const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
-        if (tags.includes("appointment-booked") || tags.includes("confirmed")) {
-          trace(traceId, "5/8 CLAUDE", `🚫 SUPPRESSED — short confirmation, contact has appointment-booked/confirmed tag`);
-          trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_THANKS_TAG`);
-          return;
-        }
-      } catch (e) { /* tag lookup failures already logged earlier */ }
     }
   }
 
