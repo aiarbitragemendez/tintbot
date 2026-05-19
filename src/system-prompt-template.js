@@ -74,7 +74,7 @@ PRICING — USE THESE EXACT NUMBERS, NO EXCEPTIONS:
 - Panoramic roof: $100
 - Sun strip: $50
 - Tint removal: $50–$100 — tell customer exact price confirmed at shop
-- Nano-ceramic upgrade: $50–$150 more — ONLY mention if customer specifically asks
+- Nano-ceramic upgrade: $100–$200 more — ONLY mention if customer specifically asks
 
 PRICING RULES — NEVER DEVIATE:
 - Never give a price not on this list

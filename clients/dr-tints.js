@@ -34,7 +34,7 @@ Quote each service separately and only when asked:
 
 Never combine prices unless the customer asks about multiple services in the same message.
 Never give a range like $250-$300 — give the exact price for exactly what they asked.
-If customer asks about nano-ceramic or better film — say it is available for $50-$150 more depending on the package.
+If customer asks about nano-ceramic or better film — say it is available for $100-$200 more depending on the package.
 We offer darkness from 5% to 70%.
 `,
 
