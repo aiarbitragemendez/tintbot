@@ -12,7 +12,7 @@ const client = {
 
   // Prefers the renamed env var; falls back to legacy name during Railway rename rollout
   ghlApiKey: process.env.GHL_API_KEY_DR_TINTS || process.env.GHL_API_KEY_PRIME_AUTO_LAB,
-  ghlLocationId: "11y3Q10E1oPAk5deBJvA",
+  ghlLocationId: "HNH2Ix0b45h0pEtAjhXo",
   ghlCalendarId: "niAbBzZJ9az0cylStfxo",
   ghlPipelineId: "11y3Q10E1oPAk5deBJvA",
   ghlPipelineStageId: "11y3Q10E1oPAk5deBJvA",
