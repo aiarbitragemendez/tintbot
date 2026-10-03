@@ -85,6 +85,81 @@ function trace(traceId, stage, msg) {
   console.log(`[${traceId}][${stage}] ${msg}`);
 }
 
+// ─── Real availability — open slots filtered to the client's booking window ──
+function getBookingWindow(client) {
+  return {
+    timezone: client.bookingTimezone || "America/New_York",
+    days: client.bookingDays || [1, 2, 3, 4, 5, 6], // 0=Sun..6=Sat — default Mon-Sat
+    startHour: client.bookingStartHour ?? 10,
+    endHour: client.bookingEndHour ?? 18,
+  };
+}
+
+function isSlotInWindow(iso, window) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return false;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: window.timezone,
+    weekday: "short",
+    hour: "numeric",
+    hour12: false,
+  }).formatToParts(d);
+  const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const weekday = WEEKDAYS[parts.find(p => p.type === "weekday")?.value];
+  const hour = parseInt(parts.find(p => p.type === "hour")?.value, 10) % 24;
+  if (!window.days.includes(weekday)) return false;
+  if (hour < window.startHour || hour >= window.endHour) return false;
+  return true;
+}
+
+function formatSlotLabel(iso, timezone) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(iso));
+}
+
+// Fetch real open slots for the next 7 days, filtered to the booking window.
+// Never throws — callers check `.ok` and must hand off rather than invent times on failure.
+async function getOpenSlots(client, traceId) {
+  const window = getBookingWindow(client);
+  const now = Date.now();
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+  try {
+    const rawSlots = await ghl.getAvailableSlots(client.ghlApiKey, client.ghlCalendarId, now, now + sevenDaysMs);
+    const filtered = (rawSlots || [])
+      .filter(iso => isSlotInWindow(iso, window))
+      .sort();
+    trace(traceId, "4/8 AVAILABILITY", `fetched ${rawSlots?.length ?? 0} raw slots → ${filtered.length} inside booking window`);
+    return { ok: true, slots: filtered, window };
+  } catch (e) {
+    trace(traceId, "4/8 AVAILABILITY", `❌ [AVAILABILITY-FETCH-FAILED] ${e.message}`);
+    return { ok: false, slots: [], window };
+  }
+}
+
+// ─── Opportunity stage moves — best-effort, never blocks the customer reply ──
+async function moveOpportunityStage(client, session, stageId, traceId, reasonTag) {
+  if (!stageId) {
+    console.log(`[${traceId}][STAGE-MOVE-SKIPPED] (${reasonTag}) — no stage id configured for this client`);
+    return;
+  }
+  if (!session.ghlOpportunityId) {
+    console.log(`[${traceId}][STAGE-MOVE-SKIPPED] (${reasonTag}) — no opportunity id on this session`);
+    return;
+  }
+  try {
+    await ghl.updateOpportunityStage(client.ghlApiKey, session.ghlOpportunityId, stageId);
+    console.log(`[${traceId}][STAGE-MOVE] ✅ opportunity ${session.ghlOpportunityId} → ${reasonTag} (${stageId})`);
+  } catch (e) {
+    console.error(`[${traceId}][STAGE-MOVE-FAILED] (${reasonTag}) opportunity ${session.ghlOpportunityId}: ${e.message}`);
+  }
+}
+
 function getSession(contactId, clientId) {
   const key = `${clientId}:${contactId}`;
   if (!sessions.has(key)) {
@@ -99,6 +174,8 @@ function getSession(contactId, clientId) {
       escalated: false,
       _escalationSynced: false,
       _contactSynced: false,
+      _notInterestedSynced: false,
+      ghlOpportunityId: null,
       collectedData: {
         name: null, phone: null, email: null,
         vehicleYear: null, vehicleMake: null, vehicleModel: null,
@@ -243,15 +320,16 @@ app.post("/ghl-webhook", async (req, res) => {
 
   const cleanText = inboundText.trim();
 
+  const session = getSession(contactId, client.clientId);
+  session._lastChannel = outboundType;
+
   // STOP / opt-out keywords are handled by GHL natively — just log and exit
   if (/^(stop|stopall|unsubscribe|cancel|end|quit)$/i.test(cleanText)) {
     trace(traceId, "3/8 ESCALATION-CHECK", `🛑 Opt-out keyword "${cleanText}" — GHL handles compliance, NOT REPLYING`);
+    await moveOpportunityStage(client, session, client.ghlNotInterestedStageId, traceId, "NOT-INTERESTED-OPTOUT");
     trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=OPT_OUT_KEYWORD`);
     return;
   }
-
-  const session = getSession(contactId, client.clientId);
-  session._lastChannel = outboundType;
 
   // ── Fetch fresh GHL tags — single source of truth for escalation state ────
   let isBotErrorRetry = false;
@@ -342,6 +420,48 @@ app.post("/ghl-webhook", async (req, res) => {
     }
   }
 
+  // ── Real availability — fetch open slots before generating a reply ───────
+  // Never let Claude invent a time: if we can't confirm real availability,
+  // hand off instead of replying.
+  let systemPromptForReply = buildSystemPrompt(client);
+  if (client.ghlApiKey && client.ghlCalendarId) {
+    const avail = await getOpenSlots(client, traceId);
+    if (!avail.ok || avail.slots.length === 0) {
+      const reasonTag = avail.ok ? "NO-OPEN-SLOTS" : "AVAILABILITY-FETCH-FAILED";
+      trace(traceId, "4/8 AVAILABILITY",
+        `❌ [${reasonTag}] ${avail.ok ? "fetch ok but 0 open slots in booking window" : "slot fetch threw"} — handing off instead of risking invented times`);
+
+      if (!session.escalationMessageSent) {
+        try {
+          await ghl.sendMessage(client.ghlApiKey, contactId,
+            "Let me get one of our specialists on this — someone will reach out to you shortly!",
+            client.ghlLocationId, outboundType);
+          session.escalationMessageSent = true;
+          session.escalated = true;
+        } catch (sendErr) {
+          console.error(`[${traceId}][${reasonTag}] Failed to send handoff message: ${sendErr.message}`);
+        }
+        try {
+          await ghl.addTag(client.ghlApiKey, contactId, ["needs-human"]);
+          await ghl.addNote(client.ghlApiKey, contactId,
+            `Bot handed off — could not confirm real calendar availability (${reasonTag}). Customer said: "${cleanText.slice(0, 200)}"`);
+        } catch (tagErr) {
+          console.error(`[${traceId}][${reasonTag}] Failed to tag/note contact: ${tagErr.message}`);
+        }
+        await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, `HANDOFF-${reasonTag}`);
+      } else {
+        trace(traceId, "4/8 AVAILABILITY", `handoff already sent this session — staying silent`);
+      }
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=${reasonTag}`);
+      return;
+    }
+
+    const slotsText = avail.slots.slice(0, 20).map(iso => formatSlotLabel(iso, avail.window.timezone)).join("; ");
+    systemPromptForReply = `${systemPromptForReply}\n\nREAL AVAILABLE SLOTS — the ONLY times you may offer or book, in ${avail.window.timezone}:\n${slotsText}`;
+  } else {
+    trace(traceId, "4/8 AVAILABILITY", `skipped — client has no ghlApiKey/ghlCalendarId configured`);
+  }
+
   // Add the new inbound message
   session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
 
@@ -355,7 +475,7 @@ app.post("/ghl-webhook", async (req, res) => {
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 400,
-      system: buildSystemPrompt(client),
+      system: systemPromptForReply,
       messages: contextMessages,
     });
     const claudeMs = Date.now() - claudeStart;
@@ -426,7 +546,7 @@ app.post("/ghl-webhook", async (req, res) => {
     trace(traceId, "7/8 STAFF-NOTIFY", `not needed (normal reply)`);
 
     // Async data extraction and GHL sync
-    syncData(session, client, cleanText, reply).catch(e =>
+    syncData(session, client, cleanText, reply, traceId).catch(e =>
       console.error(`[${traceId}][SYNC] Unhandled error:`, e.message)
     );
     trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=REPLIED`);
@@ -484,7 +604,7 @@ app.get("/health", (req, res) => {
 });
 
 // ─── Data extraction and GHL sync ────────────────────────────────────────────
-async function syncData(session, client, userMessage, botReply) {
+async function syncData(session, client, userMessage, botReply, traceId) {
   console.log("[SYNC] Starting extraction for contact:", session.contactId);
   const data = session.collectedData;
 
@@ -508,13 +628,15 @@ async function syncData(session, client, userMessage, botReply) {
   "appointmentTime": "ISO 8601 datetime or null",
   "isEscalation": false,
   "escalationReason": null,
-  "isReadyToBook": false
+  "isReadyToBook": false,
+  "isNotInterested": false
 }
 Today is ${new Date().toISOString()}. Timezone is Miami FL (ET).
 Convert relative days/times (e.g. "Friday at 10am") to ISO 8601.
 Set isReadyToBook=true only if customer confirmed a specific day AND time.
 Set isEscalation=true if customer mentions: same-day appointment, luxury or exotic vehicle over $80k, Tesla Model X, Cybertruck, fleet (2+ vehicles), work van, ProMaster, Sprinter, Transit, complaint about previous work, wants a human or owner.
 When isEscalation=true set escalationReason to a short phrase describing why (e.g. "same-day request", "Tesla Model X", "fleet inquiry", "complaint", "wants human").
+Set isNotInterested=true only if the customer clearly declines or backs out — "not interested", "no thanks", "never mind", explicitly changing their mind about booking.
 Customer said: "${userMessage}"
 Bot replied: "${botReply}"
 Already known: ${JSON.stringify(data)}`
@@ -563,8 +685,9 @@ Already known: ${JSON.stringify(data)}`
       session.ghlContactId = contact.id;
       console.log("[SYNC] Contact upserted:", contact.id);
       if (client.ghlPipelineId) {
-        await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id);
-        console.log("[SYNC] Added to pipeline");
+        const opportunity = await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id);
+        session.ghlOpportunityId = opportunity?.id || null;
+        console.log("[SYNC] Added to pipeline" + (session.ghlOpportunityId ? ` — opportunity ${session.ghlOpportunityId}` : " (no opportunity id returned)"));
       }
     } catch (e) {
       console.error("[SYNC] Contact sync error:", e.message);
@@ -576,60 +699,99 @@ Already known: ${JSON.stringify(data)}`
   console.log(`[SYNC] Booking check — isReadyToBook: ${extracted.isReadyToBook} | appointmentTime: ${data.appointmentTime} | alreadyBooked: ${data._appointmentBooked} | contactId: ${ghlContactId}`);
 
   if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
-    data._appointmentBooked = true; // optimistically lock; reset on failure below
-    console.log("[BOOKING] Booking at:", data.appointmentTime, "for contact:", ghlContactId);
-    try {
-      const bookingResult = await ghl.bookAppointment(
-        client.ghlApiKey,
-        client.ghlCalendarId,
-        ghlContactId,
-        client.ghlLocationId,
-        {
-          startTime: data.appointmentTime,
-          title: `Tint Appointment — ${data.name || "Customer"}`,
-          notes: `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via ${client.shopName} bot`,
-        }
-      );
-      console.log("[BOOKING] ✅ Appointment booked successfully:", JSON.stringify(bookingResult));
-      await ghl.addTag(client.ghlApiKey, ghlContactId, ["appointment-booked"]);
-      if (client.ghlConfirmationWorkflowId) {
-        await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlConfirmationWorkflowId);
-        console.log("[BOOKING] Confirmation workflow triggered");
-      }
-    } catch (e) {
-      // Booking failed — DO NOT pretend it succeeded. Reset flag, message customer, escalate.
-      data._appointmentBooked = false;
-      console.error("[BOOKING] ❌ FAILED — falling back gracefully and escalating");
+    // ── Booking guard — never book a time that isn't a real, currently open slot ──
+    const guardAvail = await getOpenSlots(client, traceId);
+    const requestedMs = new Date(data.appointmentTime).getTime();
+    const isValidSlot = !isNaN(requestedMs) && guardAvail.ok &&
+      guardAvail.slots.some(iso => new Date(iso).getTime() === requestedMs);
 
-      // 1. Tell the customer something honest and reassuring on whichever channel they came in on
+    if (!isValidSlot) {
+      console.log(`[${traceId}][BOOKING-GUARD-REJECTED] requested="${data.appointmentTime}" is not a currently open slot (fetchOk=${guardAvail.ok}, openCount=${guardAvail.slots.length}) — not booking`);
       try {
-        const fallbackMsg = "Let me have someone confirm that for you — one moment!";
-        // Try to detect outbound channel from session if stored, else default SMS
         const outboundType = session._lastChannel || "SMS";
-        await ghl.sendMessage(client.ghlApiKey, session.contactId, fallbackMsg, client.ghlLocationId, outboundType);
-        console.log("[BOOKING] Sent graceful fallback message to customer");
-      } catch (sendErr) {
-        console.error("[BOOKING] Could not send fallback message:", sendErr.message);
-      }
-
-      // 2. Tag and notify the shop owner so the booking gets manually completed
-      try {
-        await ghl.addTag(client.ghlApiKey, ghlContactId, ["booking-failed", "needs-human"]);
-        await ghl.addNote(
-          client.ghlApiKey,
-          ghlContactId,
-          `BOOKING FAILED — bot tried to schedule ${data.appointmentTime} but GHL API returned an error. Manual booking required.\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}\nError: ${e.response?.status || ""} ${e.message}`
-        );
-        const ownerPhone = client.escalationPhone || client.notificationPhone;
-        if (ownerPhone) {
-          const notifMsg = `🚨 Booking failed for ${data.name || "Unknown"} (${data.phone || "no phone"}) at ${data.appointmentTime}. Manual confirmation needed. Reason: ${e.response?.status || ""} ${e.message}`;
-          await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
-          console.log("[BOOKING] Owner notified of booking failure:", ownerPhone);
+        let offerMsg;
+        if (guardAvail.slots.length >= 2) {
+          offerMsg = `That time's not available — I have ${formatSlotLabel(guardAvail.slots[0], guardAvail.window.timezone)} or ${formatSlotLabel(guardAvail.slots[1], guardAvail.window.timezone)}. Which works?`;
+        } else if (guardAvail.slots.length === 1) {
+          offerMsg = `That time's not available — I have ${formatSlotLabel(guardAvail.slots[0], guardAvail.window.timezone)}. Want that one?`;
+        } else {
+          offerMsg = "Let me have someone confirm a time for you — one moment!";
         }
-      } catch (escErr) {
-        console.error("[BOOKING] Escalation after failure also errored:", escErr.message);
+        await ghl.sendMessage(client.ghlApiKey, session.contactId, offerMsg, client.ghlLocationId, outboundType);
+        console.log("[BOOKING-GUARD] Sent real alternate slots to customer");
+      } catch (sendErr) {
+        console.error(`[${traceId}][BOOKING-GUARD-FAILED] Could not send alternate-slots message:`, sendErr.message);
+      }
+    } else {
+      data._appointmentBooked = true; // optimistically lock; reset on failure below
+      console.log("[BOOKING] Booking at:", data.appointmentTime, "for contact:", ghlContactId);
+      try {
+        const bookingResult = await ghl.bookAppointment(
+          client.ghlApiKey,
+          client.ghlCalendarId,
+          ghlContactId,
+          client.ghlLocationId,
+          {
+            startTime: data.appointmentTime,
+            title: `Tint Appointment — ${data.name || "Customer"}`,
+            notes: `Vehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nWindows: ${data.windows || ""}\nPackage: ${data.tintPackage || ""}\nBooked via ${client.shopName} bot`,
+          }
+        );
+        console.log("[BOOKING] ✅ Appointment booked successfully:", JSON.stringify(bookingResult));
+        await ghl.addTag(client.ghlApiKey, ghlContactId, ["appointment-booked"]);
+        await moveOpportunityStage(client, session, client.ghlBookedStageId, traceId, "BOOKED");
+        if (client.ghlConfirmationWorkflowId) {
+          await ghl.triggerWorkflow(client.ghlApiKey, ghlContactId, client.ghlConfirmationWorkflowId);
+          console.log("[BOOKING] Confirmation workflow triggered");
+        }
+      } catch (e) {
+        // Booking failed — DO NOT pretend it succeeded. Reset flag, message customer, escalate.
+        data._appointmentBooked = false;
+        console.error("[BOOKING] ❌ FAILED — falling back gracefully and escalating");
+
+        // 1. Tell the customer something honest and reassuring on whichever channel they came in on
+        try {
+          const fallbackMsg = "Let me have someone confirm that for you — one moment!";
+          // Try to detect outbound channel from session if stored, else default SMS
+          const outboundType = session._lastChannel || "SMS";
+          await ghl.sendMessage(client.ghlApiKey, session.contactId, fallbackMsg, client.ghlLocationId, outboundType);
+          console.log("[BOOKING] Sent graceful fallback message to customer");
+        } catch (sendErr) {
+          console.error("[BOOKING] Could not send fallback message:", sendErr.message);
+        }
+
+        // 2. Tag and notify the shop owner so the booking gets manually completed
+        try {
+          await ghl.addTag(client.ghlApiKey, ghlContactId, ["booking-failed", "needs-human"]);
+          await ghl.addNote(
+            client.ghlApiKey,
+            ghlContactId,
+            `BOOKING FAILED — bot tried to schedule ${data.appointmentTime} but GHL API returned an error. Manual booking required.\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}\nError: ${e.response?.status || ""} ${e.message}`
+          );
+          await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, "HANDOFF-BOOKING-FAILED");
+          const ownerPhone = client.escalationPhone || client.notificationPhone;
+          if (ownerPhone) {
+            const notifMsg = `🚨 Booking failed for ${data.name || "Unknown"} (${data.phone || "no phone"}) at ${data.appointmentTime}. Manual confirmation needed. Reason: ${e.response?.status || ""} ${e.message}`;
+            await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
+            console.log("[BOOKING] Owner notified of booking failure:", ownerPhone);
+          }
+        } catch (escErr) {
+          console.error("[BOOKING] Escalation after failure also errored:", escErr.message);
+        }
       }
     }
+  }
+
+  // ── Not interested: tag, move stage, stop pushing ────────────────────────
+  if (extracted.isNotInterested && !session._notInterestedSynced) {
+    session._notInterestedSynced = true;
+    console.log(`[${traceId}][SYNC] Customer declined — tagging not-interested for contact:`, ghlContactId);
+    try {
+      await ghl.addTag(client.ghlApiKey, ghlContactId, ["not-interested"]);
+    } catch (e) {
+      console.error(`[${traceId}][NOT-INTERESTED-TAG-FAILED]`, e.message);
+    }
+    await moveOpportunityStage(client, session, client.ghlNotInterestedStageId, traceId, "NOT-INTERESTED-DECLINED");
   }
 
   // ── Escalation: tag, note, notify owner ─────────────────────────────────
@@ -643,6 +805,7 @@ Already known: ${JSON.stringify(data)}`
     try {
       // needs-human = intentional human handoff (NOT bot-error)
       await ghl.addTag(client.ghlApiKey, ghlContactId, ["escalated", "needs-human"]);
+      await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, "HANDOFF-ESCALATED");
       const vehicle = [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown";
       await ghl.addNote(
         client.ghlApiKey,

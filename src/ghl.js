@@ -96,7 +96,16 @@ async function getAvailableSlots(apiKey, calendarId, startDate, endDate) {
     `${BASE}/calendars/events/slots?calendarId=${calendarId}&startDate=${startDate}&endDate=${endDate}`,
     { headers: v2Headers(apiKey) }
   );
-  return res.data.slots || [];
+  const data = res.data || {};
+  if (Array.isArray(data.slots)) return data.slots;
+
+  // GHL groups slots by date: { "2026-01-05": { slots: [...] }, ... }
+  const flattened = [];
+  for (const key of Object.keys(data)) {
+    const val = data[key];
+    if (val && Array.isArray(val.slots)) flattened.push(...val.slots);
+  }
+  return flattened;
 }
 
 async function addToPipeline(apiKey, pipelineId, stageId, contactId) {
@@ -106,6 +115,22 @@ async function addToPipeline(apiKey, pipelineId, stageId, contactId) {
     { headers: v2Headers(apiKey) }
   );
   return res.data.opportunity;
+}
+
+// Move an existing opportunity to a different pipeline stage
+async function updateOpportunityStage(apiKey, opportunityId, pipelineStageId) {
+  const res = await axios.put(
+    `${BASE}/opportunities/${opportunityId}`,
+    { pipelineStageId },
+    { headers: v2Headers(apiKey), validateStatus: () => true }
+  );
+  if (res.status < 200 || res.status >= 300) {
+    const err = new Error(`GHL opportunity stage update failed with status ${res.status}`);
+    err.status = res.status;
+    err.response = { status: res.status, data: res.data };
+    throw err;
+  }
+  return res.data;
 }
 
 async function addNote(apiKey, contactId, body) {
@@ -352,6 +377,7 @@ module.exports = {
   bookAppointment,
   getAvailableSlots,
   addToPipeline,
+  updateOpportunityStage,
   addNote,
   addTag,
   removeTag,
