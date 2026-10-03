@@ -123,6 +123,40 @@ function formatSlotLabel(iso, timezone) {
   }).format(new Date(iso));
 }
 
+// Group open slots by day, split into morning / afternoon, soonest day first.
+// e.g. "Mon, Oct 5 — morning: 10:00, 10:30 | afternoon: 12:00, 1:30, 4:00"
+function formatSlotsByDay(slots, timezone) {
+  const dayFmt = new Intl.DateTimeFormat("en-US", { timeZone: timezone, weekday: "short", month: "short", day: "numeric" });
+  const timeFmt = new Intl.DateTimeFormat("en-US", { timeZone: timezone, hour: "numeric", minute: "2-digit" });
+  const hourFmt = new Intl.DateTimeFormat("en-US", { timeZone: timezone, hour: "numeric", hour12: false });
+  const days = new Map();
+  for (const iso of slots) {
+    const d = new Date(iso);
+    const day = dayFmt.format(d);
+    if (!days.has(day)) days.set(day, { morning: [], afternoon: [] });
+    const hour = parseInt(hourFmt.format(d), 10) % 24;
+    const label = timeFmt.format(d).replace(/\s?(AM|PM)$/i, "");
+    days.get(day)[hour < 12 ? "morning" : "afternoon"].push(label);
+  }
+  const lines = [];
+  for (const [day, parts] of days) {
+    const segs = [];
+    segs.push(`morning: ${parts.morning.length ? parts.morning.join(", ") : "none open"}`);
+    segs.push(`afternoon: ${parts.afternoon.length ? parts.afternoon.join(", ") : "none open"}`);
+    lines.push(`${day} — ${segs.join(" | ")}`);
+  }
+  return lines.join("\n");
+}
+
+// The open slots closest to a requested time (falls back to the soonest ones).
+function nearestSlots(slots, requestedMs, count = 2) {
+  if (isNaN(requestedMs)) return slots.slice(0, count);
+  return [...slots]
+    .sort((a, b) => Math.abs(new Date(a).getTime() - requestedMs) - Math.abs(new Date(b).getTime() - requestedMs))
+    .slice(0, count)
+    .sort();
+}
+
 // Fetch real open slots for the next 7 days, filtered to the booking window.
 // Never throws — callers check `.ok` and must hand off rather than invent times on failure.
 async function getOpenSlots(client, traceId) {
@@ -456,8 +490,8 @@ app.post("/ghl-webhook", async (req, res) => {
       return;
     }
 
-    const slotsText = avail.slots.slice(0, 20).map(iso => formatSlotLabel(iso, avail.window.timezone)).join("; ");
-    systemPromptForReply = `${systemPromptForReply}\n\nREAL AVAILABLE SLOTS — the ONLY times you may offer or book, in ${avail.window.timezone}:\n${slotsText}`;
+    const slotsText = formatSlotsByDay(avail.slots, avail.window.timezone);
+    systemPromptForReply = `${systemPromptForReply}\n\nREAL OPEN CALENDAR — every open time for the next 7 days, soonest day first, in ${avail.window.timezone}. Every time listed is genuinely open and bookable; these are the ONLY times you may offer or book:\n${slotsText}`;
   } else {
     trace(traceId, "4/8 AVAILABILITY", `skipped — client has no ghlApiKey/ghlCalendarId configured`);
   }
@@ -713,10 +747,11 @@ Already known: ${JSON.stringify(data)}`
       try {
         const outboundType = session._lastChannel || "SMS";
         let offerMsg;
-        if (guardAvail.slots.length >= 2) {
-          offerMsg = `That time's not available — I have ${formatSlotLabel(guardAvail.slots[0], guardAvail.window.timezone)} or ${formatSlotLabel(guardAvail.slots[1], guardAvail.window.timezone)}. Which works?`;
-        } else if (guardAvail.slots.length === 1) {
-          offerMsg = `That time's not available — I have ${formatSlotLabel(guardAvail.slots[0], guardAvail.window.timezone)}. Want that one?`;
+        const near = nearestSlots(guardAvail.slots, requestedMs, 2);
+        if (near.length >= 2) {
+          offerMsg = `That exact time isn't open — closest I have is ${formatSlotLabel(near[0], guardAvail.window.timezone)} or ${formatSlotLabel(near[1], guardAvail.window.timezone)}. Which works?`;
+        } else if (near.length === 1) {
+          offerMsg = `That exact time isn't open — closest I have is ${formatSlotLabel(near[0], guardAvail.window.timezone)}. Want that one?`;
         } else {
           offerMsg = "Let me have someone confirm a time for you — one moment!";
         }
