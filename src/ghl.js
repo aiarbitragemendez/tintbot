@@ -91,11 +91,11 @@ async function bookAppointment(apiKey, calendarId, contactId, locationId, { star
   }
 }
 
-async function getAvailableSlots(apiKey, calendarId, startDate, endDate) {
-  const res = await axios.get(
-    `${BASE}/calendars/events/slots?calendarId=${calendarId}&startDate=${startDate}&endDate=${endDate}`,
-    { headers: v2Headers(apiKey) }
-  );
+async function getAvailableSlots(apiKey, calendarId, startDate, endDate, timezone) {
+  // LeadConnector v2: GET /calendars/:calendarId/free-slots (startDate/endDate in epoch ms)
+  let url = `${BASE}/calendars/${calendarId}/free-slots?startDate=${startDate}&endDate=${endDate}`;
+  if (timezone) url += `&timezone=${encodeURIComponent(timezone)}`;
+  const res = await axios.get(url, { headers: v2Headers(apiKey) });
   const data = res.data || {};
   if (Array.isArray(data.slots)) return data.slots;
 
@@ -108,12 +108,45 @@ async function getAvailableSlots(apiKey, calendarId, startDate, endDate) {
   return flattened;
 }
 
-async function addToPipeline(apiKey, pipelineId, stageId, contactId) {
+// Find the contact's existing opportunity in a pipeline (e.g. one the ad/lead
+// workflow already created). Returns null if none or if the search fails.
+async function findOpportunity(apiKey, locationId, pipelineId, contactId) {
+  const res = await axios.get(
+    `${BASE}/opportunities/search?location_id=${locationId}&pipeline_id=${pipelineId}&contact_id=${contactId}&limit=20`,
+    { headers: v2Headers(apiKey), validateStatus: () => true }
+  );
+  if (res.status < 200 || res.status >= 300) {
+    console.error(`[OPPORTUNITY-SEARCH-FAILED] status ${res.status}:`, JSON.stringify(res.data));
+    return null;
+  }
+  const list = res.data?.opportunities || [];
+  return list.find(o => o.status === "open") || list[0] || null;
+}
+
+// Reuse the contact's existing opportunity in this pipeline if there is one
+// (left in whatever stage it is in); otherwise create it at stageId.
+async function addToPipeline(apiKey, pipelineId, stageId, contactId, { locationId, name } = {}) {
+  if (locationId) {
+    try {
+      const existing = await findOpportunity(apiKey, locationId, pipelineId, contactId);
+      if (existing) {
+        console.log(`[OPPORTUNITY] Reusing existing opportunity ${existing.id}`);
+        return existing;
+      }
+    } catch (e) {
+      console.error("[OPPORTUNITY-SEARCH-FAILED]", e.message);
+    }
+  }
   const res = await axios.post(
     `${BASE}/opportunities/`,
-    { pipelineId, pipelineStageId: stageId, contactId, status: "open" },
-    { headers: v2Headers(apiKey) }
+    { pipelineId, pipelineStageId: stageId, contactId, locationId, name: name || "Tint Lead", status: "open" },
+    { headers: v2Headers(apiKey), validateStatus: () => true }
   );
+  if (res.status < 200 || res.status >= 300) {
+    const err = new Error(`GHL opportunity create failed with status ${res.status}: ${JSON.stringify(res.data)}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.data.opportunity;
 }
 

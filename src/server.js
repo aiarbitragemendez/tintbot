@@ -130,7 +130,7 @@ async function getOpenSlots(client, traceId) {
   const now = Date.now();
   const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
   try {
-    const rawSlots = await ghl.getAvailableSlots(client.ghlApiKey, client.ghlCalendarId, now, now + sevenDaysMs);
+    const rawSlots = await ghl.getAvailableSlots(client.ghlApiKey, client.ghlCalendarId, now, now + sevenDaysMs, window.timezone);
     const filtered = (rawSlots || [])
       .filter(iso => isSlotInWindow(iso, window))
       .sort();
@@ -685,7 +685,10 @@ Already known: ${JSON.stringify(data)}`
       session.ghlContactId = contact.id;
       console.log("[SYNC] Contact upserted:", contact.id);
       if (client.ghlPipelineId) {
-        const opportunity = await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id);
+        const opportunity = await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, client.ghlPipelineStageId, contact.id, {
+          locationId: client.ghlLocationId,
+          name: [firstName, lastName].filter(Boolean).join(" "),
+        });
         session.ghlOpportunityId = opportunity?.id || null;
         console.log("[SYNC] Added to pipeline" + (session.ghlOpportunityId ? ` — opportunity ${session.ghlOpportunityId}` : " (no opportunity id returned)"));
       }
