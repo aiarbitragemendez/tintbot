@@ -668,7 +668,8 @@ async function syncData(session, client, userMessage, botReply, traceId) {
 Today is ${new Date().toISOString()}. Timezone is Miami FL (ET).
 Convert relative days/times (e.g. "Friday at 10am") to ISO 8601.
 Set isReadyToBook=true only if customer confirmed a specific day AND time.
-Set isEscalation=true if customer mentions: same-day appointment, luxury or exotic vehicle over $80k, Tesla Model X, Cybertruck, fleet (2+ vehicles), work van, ProMaster, Sprinter, Transit, complaint about previous work, wants a human or owner.
+Set isEscalation=true if customer mentions: ${client.escalationTriggers || "same-day appointment, luxury or exotic vehicle over $80k, Tesla Model X, Cybertruck, fleet (2+ vehicles), work van, ProMaster, Sprinter, Transit, complaint about previous work, wants a human or owner"}.
+Also set isEscalation=true if the bot's reply tells the customer that a person, a specialist or the team will reach out, call, or check on something for them.
 When isEscalation=true set escalationReason to a short phrase describing why (e.g. "same-day request", "Tesla Model X", "fleet inquiry", "complaint", "wants human").
 Set isNotInterested=true only if the customer clearly declines or backs out — "not interested", "no thanks", "never mind", explicitly changing their mind about booking.
 Customer said: "${userMessage}"
@@ -695,6 +696,20 @@ Already known: ${JSON.stringify(data)}`
   if (!client.ghlApiKey) {
     console.warn("[SYNC] No GHL API key — skipping GHL sync");
     return;
+  }
+
+  // ── Same-day requests need a rep's approval: never auto-book, always hand off ──
+  let sameDayHold = false;
+  if (client.sameDayNeedsApproval && data.appointmentTime && !data._appointmentBooked) {
+    const tz = getBookingWindow(client).timezone;
+    const dayOf = d => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+    const requested = new Date(data.appointmentTime);
+    if (!isNaN(requested.getTime()) && dayOf(requested) === dayOf(new Date())) {
+      sameDayHold = true;
+      extracted.isEscalation = true;
+      extracted.escalationReason = extracted.escalationReason || "same-day request — needs rep approval";
+      console.log(`[${traceId}][SAME-DAY-HOLD] requested="${data.appointmentTime}" is today — not auto-booking, handing off for approval`);
+    }
   }
 
   // ── Upsert contact ───────────────────────────────────────────────────────
@@ -735,7 +750,7 @@ Already known: ${JSON.stringify(data)}`
   const ghlContactId = session.ghlContactId || session.contactId;
   console.log(`[SYNC] Booking check — isReadyToBook: ${extracted.isReadyToBook} | appointmentTime: ${data.appointmentTime} | alreadyBooked: ${data._appointmentBooked} | contactId: ${ghlContactId}`);
 
-  if ((extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
+  if (!sameDayHold && (extracted.isReadyToBook || data.isReadyToBook) && data.appointmentTime && !data._appointmentBooked) {
     // ── Booking guard — never book a time that isn't a real, currently open slot ──
     const guardAvail = await getOpenSlots(client, traceId);
     const requestedMs = new Date(data.appointmentTime).getTime();
