@@ -263,20 +263,6 @@ Just answer their question directly and briefly, using the FAQ, pricing facts, a
 Never attempt to reschedule, cancel, or otherwise modify their existing appointment yourself — that is handled separately before you are even asked to reply.
 `;
 
-// Human-takeover detection: true only for a manually typed SMS from a logged-in
-// GHL staff user. Excludes calls, voicemails, and any other channel, and
-// excludes anything sent by a workflow/automation even if it carries a userId.
-function isManualStaffSms(m) {
-  if (String(m.direction).toLowerCase() !== "outbound") return false;
-  if (!m.userId) return false; // no logged-in user attached — not a human send
-  if (m.workflowId || m.automationId) return false;
-  if (typeof m.source === "string" && /workflow|automation|bot|integration|api/i.test(m.source)) return false;
-
-  const rawType = m.messageType ?? m.type;
-  const typeStr = typeof rawType === "number" ? (NUMERIC_TYPE_MAP[rawType] || String(rawType)) : String(rawType || "");
-  return typeStr.toLowerCase().includes("sms"); // excludes Call, Voicemail, Email, IG, FB, WhatsApp, etc.
-}
-
 function getSession(contactId, clientId) {
   const key = `${clientId}:${contactId}`;
   if (!sessions.has(key)) {
@@ -453,7 +439,6 @@ app.post("/ghl-webhook", async (req, res) => {
   // ── Fetch fresh GHL tags + DND — single source of truth for escalation state ──
   let isBotErrorRetry = false;
   let decision = "PROCEED";
-  let hasReturnToBotThisCall = false;
   if (client.ghlApiKey) {
     let rawTags = [];
     let isDnd = false;
@@ -483,7 +468,6 @@ app.post("/ghl-webhook", async (req, res) => {
     const hasReturnToBot = tags.includes("return-to-bot");
     const hasNeedsHuman  = tags.includes("needs-human");
     const hasBotError    = tags.includes("bot-error");
-    hasReturnToBotThisCall = hasReturnToBot;
 
     if (hasReturnToBot) {
       decision = "RESUMING (return-to-bot)";
@@ -524,36 +508,21 @@ app.post("/ghl-webhook", async (req, res) => {
 
   // ── Load GHL conversation history — EVERY inbound, not just the first ────
   // Refreshing every time (not caching after message #1) means the bot always
-  // sees messages sent outside this process too — a staff member replying
-  // directly in GHL, or a restart losing in-memory state — so it never re-asks
-  // something already answered. It also doubles as the human-takeover scan.
+  // continues from whatever was already said in the thread — including a
+  // message a human sent earlier — instead of re-asking something already
+  // answered. No human-takeover silence: staying quiet is driven only by the
+  // needs-human/staff tags and DND/opt-out checks above, not by who else
+  // texted or called this contact.
   let historyMsg = `cached (${session.messages.length} msgs in memory)`;
-  let humanTookOverRecently = false;
   if (client.ghlApiKey) {
     try {
-      const { messages: history, raw } = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
+      const { messages: history } = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
       if (history.length > 0) {
         const old = Date.now() - 60 * 60 * 1000;
         session.messages = history.map(m => ({ ...m, _ts: old }));
         historyMsg = `Refreshed ${history.length} messages from GHL`;
       } else {
         historyMsg = `No prior messages — fresh conversation`;
-      }
-
-      // Human-takeover scan: a manually typed SMS from a logged-in staff user
-      // in the last 24h — never a call, voicemail, other channel, or anything
-      // sent by a workflow/automation (see isManualStaffSms). Best-effort
-      // signal on userId/messageType — verify against real payloads below.
-      const DAY_MS = 24 * 60 * 60 * 1000;
-      const humanOutbound = raw.find(m => {
-        if (!isManualStaffSms(m)) return false;
-        const ts = new Date(m.dateAdded).getTime();
-        return !isNaN(ts) && (Date.now() - ts) < DAY_MS;
-      });
-      if (humanOutbound) {
-        humanTookOverRecently = true;
-        const rawType = humanOutbound.messageType ?? humanOutbound.type;
-        trace(traceId, "4/8 HISTORY", `👤 human-outbound SMS detected: userId=${humanOutbound.userId} type=${rawType} at ${humanOutbound.dateAdded} | keys=[${Object.keys(humanOutbound).join(",")}]`);
       }
     } catch (e) {
       historyMsg = `⚠️ history fetch failed: ${e.message} — proceeding with cached/empty context`;
@@ -562,12 +531,6 @@ app.post("/ghl-webhook", async (req, res) => {
     historyMsg = `no GHL key — using in-memory context only`;
   }
   trace(traceId, "4/8 HISTORY", historyMsg);
-
-  if (humanTookOverRecently && !hasReturnToBotThisCall) {
-    trace(traceId, "4/8 HISTORY", `🚫 [HUMAN-TAKEOVER] a human replied in this thread within 24h — staying silent until return-to-bot`);
-    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=HUMAN_TAKEOVER_SILENCE`);
-    return;
-  }
 
   // ── Booked-contact mode ───────────────────────────────────────────────────
   // Once a contact has a booked appointment, the bot never runs the sales
