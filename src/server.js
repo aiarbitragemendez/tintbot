@@ -654,6 +654,17 @@ app.post("/ghl-webhook", async (req, res) => {
     .slice(-30)
     .map(({ role, content }) => ({ role, content }));
 
+  // ── Introduction state — decided in code, not left to the model ───────────
+  // If any earlier shop-side message already names the bot, it has introduced itself.
+  if (client.botName) {
+    const alreadyIntroduced = contextMessages.some(m =>
+      m.role === "assistant" && String(m.content).toLowerCase().includes(String(client.botName).toLowerCase()));
+    systemPromptForReply += alreadyIntroduced
+      ? `\n\nINTRODUCTION STATUS: You have ALREADY introduced yourself in this conversation. Do NOT introduce yourself again, do NOT say your name, and do NOT open with a greeting like "Hey" or "Hi". Continue from the customer's last message.`
+      : `\n\nINTRODUCTION STATUS: You have NOT introduced yourself yet in this conversation. Introduce yourself once, in this reply.`;
+    trace(traceId, "4/8 INTRO", alreadyIntroduced ? "already introduced — suppressing intro" : "not yet introduced — intro allowed");
+  }
+
   const claudeStart = Date.now();
   try {
     const response = await anthropic.messages.create({

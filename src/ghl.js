@@ -310,7 +310,15 @@ async function getConversationMessages(apiKey, contactId, limit = 30) {
       `${BASE}/conversations/${conversationId}/messages?limit=${limit}`,
       { headers }
     );
-    const rawMessages = msgResponse.data?.messages?.messages || msgResponse.data?.messages || [];
+    const fetched = msgResponse.data?.messages?.messages || msgResponse.data?.messages || [];
+    // GHL returns messages newest-first. Sort oldest → newest so the conversation
+    // reads in the order it actually happened (otherwise the bot sees the thread
+    // backwards and thinks it is at the start of the conversation).
+    const stamp = m => { const t = new Date(m.dateAdded || m.dateUpdated || 0).getTime(); return isNaN(t) ? 0 : t; };
+    const rawMessages = fetched
+      .map((m, idx) => ({ m, idx }))
+      .sort((a, b) => (stamp(a.m) - stamp(b.m)) || (b.idx - a.idx))
+      .map(x => x.m);
     console.log("[GHL HISTORY] Raw messages fetched:", rawMessages.length);
 
     // Step 3: Convert to Claude format (inbound=user, outbound=assistant)
