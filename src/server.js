@@ -194,6 +194,89 @@ async function moveOpportunityStage(client, session, stageId, traceId, reasonTag
   }
 }
 
+// Send one alert SMS to every number in clients/dr-tints.js's `escalationPhones`
+// array — never just one number with a fallback. Each send is independent;
+// one bad number never blocks the others.
+async function notifyEscalationPhones(client, message, traceId, tag) {
+  const phones = client.escalationPhones || [];
+  if (phones.length === 0) {
+    console.log(`[${traceId}][${tag}] no escalationPhones configured — skipping owner SMS`);
+    return;
+  }
+  for (const phone of phones) {
+    try {
+      await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, phone, message);
+    } catch (e) {
+      console.error(`[${traceId}][${tag}] Owner SMS to ${phone} failed: ${e.message}`);
+    }
+  }
+}
+
+// ─── Shared escalation handoff ────────────────────────────────────────────────
+// Every code-level escalation path (price objection threshold, availability
+// failure, reschedule/cancel ask, the extraction model's own isEscalation) goes
+// through here, so "every escalation SMS's the same people as new-lead alerts"
+// stays true in one place instead of being re-implemented per call site.
+async function escalateNow(client, session, contactId, outboundType, traceId, reasonTag, noteText) {
+  if (session.escalationMessageSent) {
+    trace(traceId, reasonTag, `handoff already sent this session — staying silent`);
+    return;
+  }
+  try {
+    await ghl.sendMessage(client.ghlApiKey, contactId,
+      "Let me get one of our specialists on this — someone will reach out to you shortly!",
+      client.ghlLocationId, outboundType);
+    session.escalationMessageSent = true;
+    session.escalated = true;
+  } catch (sendErr) {
+    console.error(`[${traceId}][${reasonTag}] Failed to send handoff message: ${sendErr.message}`);
+  }
+  try {
+    await ghl.addTag(client.ghlApiKey, contactId, ["escalated", "needs-human"]);
+    await ghl.addNote(client.ghlApiKey, contactId, `Bot handed off (${reasonTag}). ${noteText}`);
+  } catch (tagErr) {
+    console.error(`[${traceId}][${reasonTag}] Failed to tag/note contact: ${tagErr.message}`);
+  }
+  await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, `HANDOFF-${reasonTag}`);
+
+  // Owner SMS — sent to every number in escalationPhones.
+  const data = session.collectedData || {};
+  const vehicle = [data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown";
+  const notifMsg = [
+    `🚨 TintBot Escalation — action needed`,
+    `Name: ${data.name || "Unknown"}`,
+    `Phone: ${data.phone || session.contactId}`,
+    `Vehicle: ${vehicle}`,
+    `Reason: ${reasonTag}`,
+    `Last msg: "${noteText.slice(0, 160)}"`,
+  ].join("\n");
+  await notifyEscalationPhones(client, notifMsg, traceId, reasonTag);
+}
+
+// A contact with a booked appointment never runs the sales flow again — this
+// override is appended to the full system prompt so Claude ignores everything
+// above about qualifying, quoting, or booking a NEW appointment.
+const BOOKED_OVERRIDE_BLOCK = `
+BOOKED APPOINTMENT MODE — THIS CONTACT ALREADY HAS A CONFIRMED APPOINTMENT
+Ignore every instruction above about qualifying a lead, quoting a price, or booking a NEW appointment — none of that applies here. Do not start the sales flow, do not re-ask what they want tinted, do not quote a price.
+Just answer their question directly and briefly, using the FAQ, pricing facts, and shop info above only as reference.
+Never attempt to reschedule, cancel, or otherwise modify their existing appointment yourself — that is handled separately before you are even asked to reply.
+`;
+
+// Human-takeover detection: true only for a manually typed SMS from a logged-in
+// GHL staff user. Excludes calls, voicemails, and any other channel, and
+// excludes anything sent by a workflow/automation even if it carries a userId.
+function isManualStaffSms(m) {
+  if (String(m.direction).toLowerCase() !== "outbound") return false;
+  if (!m.userId) return false; // no logged-in user attached — not a human send
+  if (m.workflowId || m.automationId) return false;
+  if (typeof m.source === "string" && /workflow|automation|bot|integration|api/i.test(m.source)) return false;
+
+  const rawType = m.messageType ?? m.type;
+  const typeStr = typeof rawType === "number" ? (NUMERIC_TYPE_MAP[rawType] || String(rawType)) : String(rawType || "");
+  return typeStr.toLowerCase().includes("sms"); // excludes Call, Voicemail, Email, IG, FB, WhatsApp, etc.
+}
+
 function getSession(contactId, clientId) {
   const key = `${clientId}:${contactId}`;
   if (!sessions.has(key)) {
@@ -203,7 +286,6 @@ function getSession(contactId, clientId) {
       contactId,
       messages: [],
       ghlContactId: contactId,
-      historyLoaded: false,
       escalationMessageSent: false,
       escalated: false,
       _escalationSynced: false,
@@ -212,6 +294,7 @@ function getSession(contactId, clientId) {
       ghlOpportunityId: null,
       priceObjectionCount: 0,
       _priceObjectionCountedSinceReply: false,
+      _depositThankYouSent: false,
       collectedData: {
         name: null, phone: null, email: null,
         vehicleYear: null, vehicleMake: null, vehicleModel: null,
@@ -367,22 +450,40 @@ app.post("/ghl-webhook", async (req, res) => {
     return;
   }
 
-  // ── Fetch fresh GHL tags — single source of truth for escalation state ────
+  // ── Fetch fresh GHL tags + DND — single source of truth for escalation state ──
   let isBotErrorRetry = false;
   let decision = "PROCEED";
+  let hasReturnToBotThisCall = false;
   if (client.ghlApiKey) {
     let rawTags = [];
+    let isDnd = false;
     try {
-      rawTags = await ghl.getContactTags(client.ghlApiKey, contactId);
+      const contactInfo = await ghl.getContactTags(client.ghlApiKey, contactId);
+      rawTags = contactInfo.tags;
+      isDnd = contactInfo.dnd;
       session._cachedTags = rawTags;
     } catch (e) {
       trace(traceId, "3/8 ESCALATION-CHECK", `⚠️ Could not fetch contact tags: ${e.message} — proceeding without tag info`);
     }
 
     const tags = rawTags.map(t => String(t).toLowerCase());
+
+    // ── Absolute no-reply conditions — checked before any other tag logic ──
+    if (tags.includes("staff")) {
+      trace(traceId, "3/8 ESCALATION-CHECK", `🚫 [STAFF-CONTACT] tagged "staff" — never replying`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=STAFF_CONTACT_IGNORED`);
+      return;
+    }
+    if (isDnd) {
+      trace(traceId, "3/8 ESCALATION-CHECK", `🚫 [DND] contact is on DND — never replying`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=DND_IGNORED`);
+      return;
+    }
+
     const hasReturnToBot = tags.includes("return-to-bot");
     const hasNeedsHuman  = tags.includes("needs-human");
     const hasBotError    = tags.includes("bot-error");
+    hasReturnToBotThisCall = hasReturnToBot;
 
     if (hasReturnToBot) {
       decision = "RESUMING (return-to-bot)";
@@ -421,37 +522,110 @@ app.post("/ghl-webhook", async (req, res) => {
     trace(traceId, "3/8 ESCALATION-CHECK", `no GHL key configured for client → DECISION: PROCEED (skipping tag check)`);
   }
 
-  // ── Load GHL conversation history (first inbound after restart) ──────────
+  // ── Load GHL conversation history — EVERY inbound, not just the first ────
+  // Refreshing every time (not caching after message #1) means the bot always
+  // sees messages sent outside this process too — a staff member replying
+  // directly in GHL, or a restart losing in-memory state — so it never re-asks
+  // something already answered. It also doubles as the human-takeover scan.
   let historyMsg = `cached (${session.messages.length} msgs in memory)`;
-  if (!session.historyLoaded && client.ghlApiKey) {
-    session.historyLoaded = true;
+  let humanTookOverRecently = false;
+  if (client.ghlApiKey) {
     try {
-      const history = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
+      const { messages: history, raw } = await ghl.getConversationMessages(client.ghlApiKey, contactId, 30);
       if (history.length > 0) {
         const old = Date.now() - 60 * 60 * 1000;
         session.messages = history.map(m => ({ ...m, _ts: old }));
-        historyMsg = `Fetched ${history.length} messages from GHL`;
+        historyMsg = `Refreshed ${history.length} messages from GHL`;
       } else {
         historyMsg = `No prior messages — fresh conversation`;
       }
+
+      // Human-takeover scan: a manually typed SMS from a logged-in staff user
+      // in the last 24h — never a call, voicemail, other channel, or anything
+      // sent by a workflow/automation (see isManualStaffSms). Best-effort
+      // signal on userId/messageType — verify against real payloads below.
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const humanOutbound = raw.find(m => {
+        if (!isManualStaffSms(m)) return false;
+        const ts = new Date(m.dateAdded).getTime();
+        return !isNaN(ts) && (Date.now() - ts) < DAY_MS;
+      });
+      if (humanOutbound) {
+        humanTookOverRecently = true;
+        const rawType = humanOutbound.messageType ?? humanOutbound.type;
+        trace(traceId, "4/8 HISTORY", `👤 human-outbound SMS detected: userId=${humanOutbound.userId} type=${rawType} at ${humanOutbound.dateAdded} | keys=[${Object.keys(humanOutbound).join(",")}]`);
+      }
     } catch (e) {
-      historyMsg = `⚠️ history fetch failed: ${e.message} — proceeding with empty context`;
+      historyMsg = `⚠️ history fetch failed: ${e.message} — proceeding with cached/empty context`;
     }
+  } else {
+    historyMsg = `no GHL key — using in-memory context only`;
   }
   trace(traceId, "4/8 HISTORY", historyMsg);
 
-  // ── Post-booking total silence ──────────────────────────────────────────
-  // Once a contact has a booked appointment, the bot stops replying to ANY
-  // inbound. Owner handles deposits, reschedules, and service questions manually.
+  if (humanTookOverRecently && !hasReturnToBotThisCall) {
+    trace(traceId, "4/8 HISTORY", `🚫 [HUMAN-TAKEOVER] a human replied in this thread within 24h — staying silent until return-to-bot`);
+    trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=HUMAN_TAKEOVER_SILENCE`);
+    return;
+  }
+
+  // ── Booked-contact mode ───────────────────────────────────────────────────
+  // Once a contact has a booked appointment, the bot never runs the sales
+  // flow again. It still answers direct questions; reschedule/cancel asks are
+  // escalated deterministically (the bot never attempts to modify a booking).
   // Triggers: in-session booking flag OR GHL tag `appointment-booked`/`confirmed`.
   {
     const sessionBooked = session.collectedData._appointmentBooked === true;
     const tags = (session._cachedTags || []).map(t => String(t).toLowerCase());
     const tagBooked = tags.includes("appointment-booked") || tags.includes("confirmed");
     if (sessionBooked || tagBooked) {
-      trace(traceId, "5/8 CLAUDE",
-        `🚫 POST-BOOKING SILENCE — session=${sessionBooked} tag=${tagBooked} | inbound="${cleanText.slice(0, 80)}"`);
-      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=POST_BOOKING_SILENCE`);
+      // 1. GHL's deposit-link text asks the customer to reply "Yes" once paid.
+      // Thank them once, deterministically (never via Claude) — no risk of
+      // restarting the sales flow.
+      const DEPOSIT_YES_RE = /^(yes|yep|yup|yeah|yea|y|done|paid|just paid|all set|confirmed)[.!]?$/i;
+      if (DEPOSIT_YES_RE.test(cleanText) && !session._depositThankYouSent) {
+        session._depositThankYouSent = true;
+        trace(traceId, "5/8 CLAUDE", `💰 DEPOSIT CONFIRMATION — treating "${cleanText}" as deposit paid, sending one-time thank you`);
+        try {
+          const thankYou = "Awesome, got it — thank you! See you soon.";
+          await ghl.sendMessage(client.ghlApiKey, contactId, thankYou, client.ghlLocationId, outboundType);
+          session.messages.push({ role: "assistant", content: thankYou, _ts: Date.now() });
+          trace(traceId, "6/8 OUTBOUND", `✅ Sent deposit thank-you`);
+        } catch (sendErr) {
+          console.error(`[${traceId}][DEPOSIT-THANKYOU-FAILED] ${sendErr.message}`);
+        }
+        trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=DEPOSIT_CONFIRMED`);
+        return;
+      }
+
+      // 2. Reschedule/cancel — never attempted by the bot, always a hand-off.
+      const RESCHEDULE_CANCEL_RE = /\b(reschedul\w*|cancel\w*|move my appointment|change (my|the) (appointment|time|date)|can'?t make it|need to push|different (day|time)|postpone\w*)\b/i;
+      if (RESCHEDULE_CANCEL_RE.test(cleanText)) {
+        trace(traceId, "5/8 CLAUDE", `📅 [RESCHEDULE-CANCEL] booked contact asked to change/cancel — escalating, not attempting it`);
+        await escalateNow(client, session, contactId, outboundType, traceId, "RESCHEDULE-CANCEL",
+          `Booked contact asked to reschedule/cancel. Last message: "${cleanText.slice(0, 200)}"`);
+        trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=RESCHEDULE_CANCEL_ESCALATED`);
+        return;
+      }
+
+      // 3. Anything else — answer the question, restricted mode, no sales flow.
+      trace(traceId, "5/8 CLAUDE", `📘 BOOKED-CONTACT Q&A mode — answering without running the sales flow`);
+      const lastMsgSoFar = session.messages[session.messages.length - 1];
+      if (!lastMsgSoFar || lastMsgSoFar.role !== "user" || lastMsgSoFar.content !== cleanText) {
+        session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
+      }
+      const bookedPrompt = `${buildSystemPrompt(client)}\n\n${BOOKED_OVERRIDE_BLOCK}`;
+      const bookedContext = session.messages.filter(isValidMessage).slice(-30).map(({ role, content }) => ({ role, content }));
+      try {
+        const response = await anthropic.messages.create({ model: MODEL, max_tokens: 300, system: bookedPrompt, messages: bookedContext });
+        const reply = response.content[0].text;
+        session.messages.push({ role: "assistant", content: String(reply), _ts: Date.now() });
+        await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
+        trace(traceId, "6/8 OUTBOUND", `✅ Sent booked-contact reply`);
+      } catch (e) {
+        console.error(`[${traceId}][BOOKED-CONTACT-REPLY-FAILED] ${e.message}`);
+      }
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=BOOKED_CONTACT_REPLIED`);
       return;
     }
   }
@@ -476,27 +650,8 @@ app.post("/ghl-webhook", async (req, res) => {
     if (session.priceObjectionCount >= client.priceObjectionEscalateAfter) {
       trace(traceId, "3/8 ESCALATION-CHECK",
         `❌ [PRICE-OBJECTION-ESCALATED] hit threshold — handing off instead of answering again`);
-      if (!session.escalationMessageSent) {
-        try {
-          await ghl.sendMessage(client.ghlApiKey, contactId,
-            "Let me get one of our specialists on this — someone will reach out to you shortly!",
-            client.ghlLocationId, outboundType);
-          session.escalationMessageSent = true;
-          session.escalated = true;
-        } catch (sendErr) {
-          console.error(`[${traceId}][PRICE-OBJECTION-ESCALATED] Failed to send handoff message: ${sendErr.message}`);
-        }
-        try {
-          await ghl.addTag(client.ghlApiKey, contactId, ["escalated", "needs-human"]);
-          await ghl.addNote(client.ghlApiKey, contactId,
-            `Bot handed off — ${session.priceObjectionCount} separate price objections. Last message: "${cleanText.slice(0, 200)}"`);
-        } catch (tagErr) {
-          console.error(`[${traceId}][PRICE-OBJECTION-ESCALATED] Failed to tag/note contact: ${tagErr.message}`);
-        }
-        await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, "HANDOFF-PRICE-OBJECTION");
-      } else {
-        trace(traceId, "3/8 ESCALATION-CHECK", `handoff already sent this session — staying silent`);
-      }
+      await escalateNow(client, session, contactId, outboundType, traceId, "PRICE-OBJECTION-ESCALATED",
+        `${session.priceObjectionCount} separate price objections. Last message: "${cleanText.slice(0, 200)}"`);
       trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=PRICE-OBJECTION-ESCALATED`);
       return;
     }
@@ -512,28 +667,8 @@ app.post("/ghl-webhook", async (req, res) => {
       const reasonTag = avail.ok ? "NO-OPEN-SLOTS" : "AVAILABILITY-FETCH-FAILED";
       trace(traceId, "4/8 AVAILABILITY",
         `❌ [${reasonTag}] ${avail.ok ? "fetch ok but 0 open slots in booking window" : "slot fetch threw"} — handing off instead of risking invented times`);
-
-      if (!session.escalationMessageSent) {
-        try {
-          await ghl.sendMessage(client.ghlApiKey, contactId,
-            "Let me get one of our specialists on this — someone will reach out to you shortly!",
-            client.ghlLocationId, outboundType);
-          session.escalationMessageSent = true;
-          session.escalated = true;
-        } catch (sendErr) {
-          console.error(`[${traceId}][${reasonTag}] Failed to send handoff message: ${sendErr.message}`);
-        }
-        try {
-          await ghl.addTag(client.ghlApiKey, contactId, ["needs-human"]);
-          await ghl.addNote(client.ghlApiKey, contactId,
-            `Bot handed off — could not confirm real calendar availability (${reasonTag}). Customer said: "${cleanText.slice(0, 200)}"`);
-        } catch (tagErr) {
-          console.error(`[${traceId}][${reasonTag}] Failed to tag/note contact: ${tagErr.message}`);
-        }
-        await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, `HANDOFF-${reasonTag}`);
-      } else {
-        trace(traceId, "4/8 AVAILABILITY", `handoff already sent this session — staying silent`);
-      }
+      await escalateNow(client, session, contactId, outboundType, traceId, reasonTag,
+        `Could not confirm real calendar availability. Customer said: "${cleanText.slice(0, 200)}"`);
       trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=${reasonTag}`);
       return;
     }
@@ -544,8 +679,12 @@ app.post("/ghl-webhook", async (req, res) => {
     trace(traceId, "4/8 AVAILABILITY", `skipped — client has no ghlApiKey/ghlCalendarId configured`);
   }
 
-  // Add the new inbound message
-  session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
+  // Add the new inbound message — defensive check since history was just
+  // refreshed from GHL and may already include it.
+  const lastMsgSoFar = session.messages[session.messages.length - 1];
+  if (!lastMsgSoFar || lastMsgSoFar.role !== "user" || lastMsgSoFar.content !== cleanText) {
+    session.messages.push({ role: "user", content: cleanText, _ts: Date.now() });
+  }
 
   const contextMessages = session.messages
     .filter(isValidMessage)
@@ -617,13 +756,11 @@ app.post("/ghl-webhook", async (req, res) => {
         }
       }
       // Notify owner once per failure spike (best-effort)
-      try {
-        const ownerPhone = client.escalationPhone || client.notificationPhone;
-        if (ownerPhone && !isBotErrorRetry) {
-          await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone,
-            `🤖 TintBot send-fail on ${outboundType} for contact ${contactId}. Status=${sendErr.response?.status || "?"}.`);
-        }
-      } catch (notifyErr) { /* swallow notify errors */ }
+      if (!isBotErrorRetry) {
+        await notifyEscalationPhones(client,
+          `🤖 TintBot send-fail on ${outboundType} for contact ${contactId}. Status=${sendErr.response?.status || "?"}.`,
+          traceId, "SEND-FAIL");
+      }
     }
 
     trace(traceId, "7/8 STAFF-NOTIFY", `not needed (normal reply)`);
@@ -643,17 +780,11 @@ app.post("/ghl-webhook", async (req, res) => {
       await ghl.addTag(client.ghlApiKey, contactId, ["bot-error"]);
       trace(traceId, "6/8 OUTBOUND", `Skipped (Claude failed) — tagged bot-error for auto-retry`);
 
-      if (!isBotErrorRetry) {
-        const ownerPhone = client.escalationPhone || client.notificationPhone;
-        if (ownerPhone) {
-          await ghl.sendSMSToPhone(
-            client.ghlApiKey,
-            client.ghlLocationId,
-            ownerPhone,
-            `🤖 TintBot API error — contact ${contactId} on ${outboundType} could not get a reply.\nLast msg: "${cleanText.slice(0, 120)}"\nTag is bot-error (auto-retries on next message). No action needed unless outage persists.`
-          );
-          staffNotified = true;
-        }
+      if (!isBotErrorRetry && (client.escalationPhones || []).length > 0) {
+        await notifyEscalationPhones(client,
+          `🤖 TintBot API error — contact ${contactId} on ${outboundType} could not get a reply.\nLast msg: "${cleanText.slice(0, 120)}"\nTag is bot-error (auto-retries on next message). No action needed unless outage persists.`,
+          traceId, "BOT-ERROR");
+        staffNotified = true;
       }
     } catch (escErr) {
       trace(traceId, "6/8 OUTBOUND", `❌ Failed to apply bot-error tag: ${escErr.message}`);
@@ -871,12 +1002,8 @@ Already known: ${JSON.stringify(data)}`
             `BOOKING FAILED — bot tried to schedule ${data.appointmentTime} but GHL API returned an error. Manual booking required.\nVehicle: ${[data.vehicleYear, data.vehicleMake, data.vehicleModel].filter(Boolean).join(" ") || "Unknown"}\nPhone: ${data.phone || "Unknown"}\nError: ${e.response?.status || ""} ${e.message}`
           );
           await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, "HANDOFF-BOOKING-FAILED");
-          const ownerPhone = client.escalationPhone || client.notificationPhone;
-          if (ownerPhone) {
-            const notifMsg = `🚨 Booking failed for ${data.name || "Unknown"} (${data.phone || "no phone"}) at ${data.appointmentTime}. Manual confirmation needed. Reason: ${e.response?.status || ""} ${e.message}`;
-            await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
-            console.log("[BOOKING] Owner notified of booking failure:", ownerPhone);
-          }
+          const notifMsg = `🚨 Booking failed for ${data.name || "Unknown"} (${data.phone || "no phone"}) at ${data.appointmentTime}. Manual confirmation needed. Reason: ${e.response?.status || ""} ${e.message}`;
+          await notifyEscalationPhones(client, notifMsg, traceId, "BOOKING-FAILED");
         } catch (escErr) {
           console.error("[BOOKING] Escalation after failure also errored:", escErr.message);
         }
@@ -919,8 +1046,7 @@ Already known: ${JSON.stringify(data)}`
         console.log("[ESCALATION] Escalation workflow triggered");
       }
       // Send SMS notification to shop owner (once per conversation)
-      const ownerPhone = client.escalationPhone || client.notificationPhone;
-      if (ownerPhone && !session.escalationMessageSent) {
+      if (!session.escalationMessageSent) {
         const contactLink = `https://app.gohighlevel.com/v2/location/${client.ghlLocationId}/contacts/detail/${ghlContactId}`;
         const notifMsg = [
           `🚨 TintBot Escalation — action needed`,
@@ -932,10 +1058,10 @@ Already known: ${JSON.stringify(data)}`
           `GHL: ${contactLink}`,
           `→ Reply or handle in GHL. Add tag return-to-bot when ready to hand back to Camila.`,
         ].join("\n");
-        await ghl.sendSMSToPhone(client.ghlApiKey, client.ghlLocationId, ownerPhone, notifMsg);
+        await notifyEscalationPhones(client, notifMsg, traceId, "ESCALATED");
         session.escalationMessageSent = true;
-        console.log("[ESCALATION] Owner notification sent to:", ownerPhone);
-      } else if (session.escalationMessageSent) {
+        console.log("[ESCALATION] Owner notification sent");
+      } else {
         console.log("[ESCALATION] Owner notification already sent this session — skipping");
       }
     } catch (e) {

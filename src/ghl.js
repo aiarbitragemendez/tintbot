@@ -279,7 +279,9 @@ async function verifyLocationAccess(apiKey, locationId) {
   return { ok: res.status >= 200 && res.status < 300, status: res.status, body: res.data };
 }
 
-// Fetch last N messages from GHL conversation and convert to Claude message format
+// Fetch last N messages from GHL conversation. Returns both the Claude-format
+// array (for context) and the raw message objects (for the human-takeover
+// scan in server.js, which needs direction/dateAdded/userId per message).
 async function getConversationMessages(apiKey, contactId, limit = 30) {
   const headers = v2Headers(apiKey);
 
@@ -293,13 +295,13 @@ async function getConversationMessages(apiKey, contactId, limit = 30) {
     const conversations = convResponse.data?.conversations;
     if (!conversations || conversations.length === 0) {
       console.log("[GHL HISTORY] No conversation found for contact:", contactId);
-      return [];
+      return { messages: [], raw: [] };
     }
     conversationId = conversations[0].id;
     console.log("[GHL HISTORY] Found conversation:", conversationId);
   } catch (e) {
     console.error("[GHL HISTORY] Conversation search error:", e.message);
-    return [];
+    return { messages: [], raw: [] };
   }
 
   // Step 2: Fetch messages from conversation
@@ -337,14 +339,14 @@ async function getConversationMessages(apiKey, contactId, limit = 30) {
     }
 
     console.log("[GHL HISTORY] Converted to", deduplicated.length, "Claude messages");
-    return deduplicated.slice(-limit);
+    return { messages: deduplicated.slice(-limit), raw: rawMessages };
   } catch (e) {
     console.error("[GHL HISTORY] Message fetch error:", e.message);
-    return [];
+    return { messages: [], raw: [] };
   }
 }
 
-// Fetch tags for a given contact
+// Fetch tags and DND status for a given contact (one call covers both).
 async function getContactTags(apiKey, contactId) {
   const headers = v2Headers(apiKey);
   try {
@@ -352,11 +354,12 @@ async function getContactTags(apiKey, contactId) {
       `${BASE}/contacts/${contactId}`,
       { headers }
     );
-    const tags = res.data?.contact?.tags || res.data?.tags || [];
-    return Array.isArray(tags) ? tags : [];
+    const contact = res.data?.contact || res.data || {};
+    const tags = contact.tags || [];
+    return { tags: Array.isArray(tags) ? tags : [], dnd: contact.dnd === true };
   } catch (e) {
     console.error("[GHL] getContactTags error:", e.message);
-    return [];
+    return { tags: [], dnd: false };
   }
 }
 

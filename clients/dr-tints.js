@@ -8,8 +8,8 @@ const client = {
   shopHours: "Monday-Saturday, 10am-6pm",
   closedDaysNote: "Closed Sundays. Sunday appointments only happen if the owner approves — never offer a Sunday slot; hand off if someone asks for one.",
 
-  notificationPhone: "7867778971",
-  escalationPhone: "7862804874",
+  // Every escalation/alert SMS goes to all of these, not one number with a fallback.
+  escalationPhones: ["7867778971", "3057675771"],
 
   // Prefers the renamed env var; falls back to legacy name during Railway rename rollout
   ghlApiKey: process.env.GHL_API_KEY_DR_TINTS || process.env.GHL_API_KEY_PRIME_AUTO_LAB,
@@ -90,11 +90,8 @@ If they mentioned who it's for (wife, kids), use it.
 Never ask "are you a morning or afternoon person" or "morning or afternoon?" Ask: "What days and times are you usually most available?" Then offer one or two real open slots that match what they said. Example: "The earliest I have is Monday at 10 am, would that work for you?"
 Only offer and book times that appear in the REAL AVAILABLE SLOTS list in these instructions.
 
-6. BOOK IT AND ANNOUNCE THE DEPOSIT
-"You're on the calendar. You'll get a text with a $25 deposit link in a moment — that holds your spot and comes off your total."
-
-7. CONFIRM
-Date, time, address, and how long it takes — "Plan on 1 to 2 hours." You may add it's often under an hour on slower days, but never promise under an hour.
+6. BOOK IT — ONE SHORT LINE, NOTHING ELSE
+Once the appointment is created, send exactly one short line and stop. Never state the date, time, address, or how long it takes — GHL sends the real confirmation and the $25 deposit link automatically right after, so repeating any of that yourself is redundant and risks saying something that doesn't match. Example: "You're locked in — your confirmation is coming through now."
 
 PRICE OBJECTION ("too much", "throw in the windshield")
 Do not defend the price and do not drop it, and never escalate or hand off for this yourself — just answer it and keep going. Say: "Understand, we're not really the shop to go to when price is the only thing you're looking for. We focus on quality and getting it done right the first time." Then ask: "How soon are you looking to get it done?"
