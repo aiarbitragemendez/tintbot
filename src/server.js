@@ -210,6 +210,8 @@ function getSession(contactId, clientId) {
       _contactSynced: false,
       _notInterestedSynced: false,
       ghlOpportunityId: null,
+      priceObjectionCount: 0,
+      _priceObjectionCountedSinceReply: false,
       collectedData: {
         name: null, phone: null, email: null,
         vehicleYear: null, vehicleMake: null, vehicleModel: null,
@@ -454,6 +456,52 @@ app.post("/ghl-webhook", async (req, res) => {
     }
   }
 
+  // ── Price objection counter — code-counted, never guessed by the extraction model ──
+  // A price objection never escalates or marks not-interested by itself. The bot answers
+  // it (see PRICE OBJECTION in the system prompt) every time; only once the SAME contact
+  // has pushed back `priceObjectionEscalateAfter` separate times do we intercept and hand
+  // off here, deterministically, instead of letting Claude reply again.
+  const PRICE_OBJECTION_RE = /\b(too much|too expensive|that'?s a lot|pricey|pricy|can(?:'?t| ?not) afford|lower(?: the)? price|any cheaper|cheaper|discount|price match|better (?:price|deal)|knock (?:it|something) off|come down on (?:the )?price|throw in (?:the )?(?:windshield|something)|do(?:es)? it for less)\b/i;
+  if (client.priceObjectionEscalateAfter && PRICE_OBJECTION_RE.test(cleanText)) {
+    if (!session._priceObjectionCountedSinceReply) {
+      session.priceObjectionCount = (session.priceObjectionCount || 0) + 1;
+      session._priceObjectionCountedSinceReply = true;
+      trace(traceId, "3/8 ESCALATION-CHECK",
+        `price objection #${session.priceObjectionCount} (threshold ${client.priceObjectionEscalateAfter}): "${cleanText.slice(0, 80)}"`);
+    } else {
+      trace(traceId, "3/8 ESCALATION-CHECK",
+        `price objection text again, but bot hasn't replied since the last one — not double-counting: "${cleanText.slice(0, 80)}"`);
+    }
+
+    if (session.priceObjectionCount >= client.priceObjectionEscalateAfter) {
+      trace(traceId, "3/8 ESCALATION-CHECK",
+        `❌ [PRICE-OBJECTION-ESCALATED] hit threshold — handing off instead of answering again`);
+      if (!session.escalationMessageSent) {
+        try {
+          await ghl.sendMessage(client.ghlApiKey, contactId,
+            "Let me get one of our specialists on this — someone will reach out to you shortly!",
+            client.ghlLocationId, outboundType);
+          session.escalationMessageSent = true;
+          session.escalated = true;
+        } catch (sendErr) {
+          console.error(`[${traceId}][PRICE-OBJECTION-ESCALATED] Failed to send handoff message: ${sendErr.message}`);
+        }
+        try {
+          await ghl.addTag(client.ghlApiKey, contactId, ["escalated", "needs-human"]);
+          await ghl.addNote(client.ghlApiKey, contactId,
+            `Bot handed off — ${session.priceObjectionCount} separate price objections. Last message: "${cleanText.slice(0, 200)}"`);
+        } catch (tagErr) {
+          console.error(`[${traceId}][PRICE-OBJECTION-ESCALATED] Failed to tag/note contact: ${tagErr.message}`);
+        }
+        await moveOpportunityStage(client, session, client.ghlHandoffStageId, traceId, "HANDOFF-PRICE-OBJECTION");
+      } else {
+        trace(traceId, "3/8 ESCALATION-CHECK", `handoff already sent this session — staying silent`);
+      }
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=PRICE-OBJECTION-ESCALATED`);
+      return;
+    }
+  }
+
   // ── Real availability — fetch open slots before generating a reply ───────
   // Never let Claude invent a time: if we can't confirm real availability,
   // hand off instead of replying.
@@ -556,6 +604,7 @@ app.post("/ghl-webhook", async (req, res) => {
       const sendRes = await ghl.sendMessage(client.ghlApiKey, contactId, reply, client.ghlLocationId, outboundType);
       const sentId = sendRes?.messageId || sendRes?.id || sendRes?.message?.id || "unknown";
       trace(traceId, "6/8 OUTBOUND", `✅ Sent | messageId=${sentId} | took=${Date.now() - sendStart}ms`);
+      session._priceObjectionCountedSinceReply = false; // bot actually got a reply through — next objection counts fresh
     } catch (sendErr) {
       trace(traceId, "6/8 OUTBOUND",
         `❌ Send failed on channel ${outboundType} | status=${sendErr.response?.status || "?"} | err=${sendErr.message}`);
@@ -671,7 +720,7 @@ Set isReadyToBook=true only if customer confirmed a specific day AND time.
 Set isEscalation=true if customer mentions: ${client.escalationTriggers || "same-day appointment, luxury or exotic vehicle over $80k, Tesla Model X, Cybertruck, fleet (2+ vehicles), work van, ProMaster, Sprinter, Transit, complaint about previous work, wants a human or owner"}.
 Also set isEscalation=true if the bot's reply tells the customer that a person, a specialist or the team will reach out, call, or check on something for them.
 When isEscalation=true set escalationReason to a short phrase describing why (e.g. "same-day request", "Tesla Model X", "fleet inquiry", "complaint", "wants human").
-Set isNotInterested=true only if the customer clearly declines or backs out — "not interested", "no thanks", "never mind", explicitly changing their mind about booking.
+Set isNotInterested=true only if the customer clearly declines or backs out — "not interested", "no thanks", "never mind", "went somewhere else", "found another shop", explicitly changing their mind about booking. A price objection ("too much", asking for a discount, etc.) is NEVER by itself isNotInterested — that is a price objection, handled separately. Do not set isNotInterested just because they pushed back on price.
 Customer said: "${userMessage}"
 Bot replied: "${botReply}"
 Already known: ${JSON.stringify(data)}`

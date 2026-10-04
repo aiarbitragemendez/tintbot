@@ -30,7 +30,11 @@ const client = {
   // Same-day appointments are allowed but a sales rep must approve them — the bot never books them itself
   sameDayNeedsApproval: true,
   // What makes the server tag needs-human, move the lead to the handoff stage and text the rep
-  escalationTriggers: "a same-day appointment (today), any Sunday appointment, Tesla Model X, Cybertruck, any question about tinting a Tesla roof or glass roof, PPF, ceramic coating, residential or commercial tint, fleet or multiple vehicles (2+), work van, ProMaster, Sprinter, Transit, a complaint or warranty claim about previous work, wants a human, a phone call or the owner, pushes back on price a second time",
+  // Price pushback is deliberately NOT in this list — that's counted in code (priceObjectionEscalateAfter below), never guessed by this extraction model.
+  escalationTriggers: "a same-day appointment (today), any Sunday appointment, Tesla Model X, Cybertruck, any question about tinting a Tesla roof or glass roof, PPF, ceramic coating, residential or commercial tint, fleet or multiple vehicles (2+), work van, ProMaster, Sprinter, Transit, a complaint or warranty claim about previous work, wants a human, a phone call or the owner",
+  // Price objections are handled by the bot itself (see PRICE OBJECTION in conversationFlowGuide) and counted in server.js —
+  // only the Nth separate pushback hands off. Set to 0/undefined to disable the counter entirely.
+  priceObjectionEscalateAfter: 3,
 
   toneGuide: `
 YOUR #1 JOB
@@ -93,8 +97,8 @@ Only offer and book times that appear in the REAL AVAILABLE SLOTS list in these 
 Date, time, address, and how long it takes — "Plan on 1 to 2 hours." You may add it's often under an hour on slower days, but never promise under an hour.
 
 PRICE OBJECTION ("too much", "throw in the windshield")
-Do not defend the price and do not drop it. Say: "Understand, we're not really the shop to go to when price is the only thing you're looking for. We focus on quality and getting it done right the first time." Then ask: "How soon are you looking to get it done?"
-A second price pushback after this is a hand off — see ESCALATION RULES.
+Do not defend the price and do not drop it, and never escalate or hand off for this yourself — just answer it and keep going. Say: "Understand, we're not really the shop to go to when price is the only thing you're looking for. We focus on quality and getting it done right the first time." Then ask: "How soon are you looking to get it done?"
+A price objection is never, by itself, a reason to mark the lead not-interested or end the conversation — keep going unless they clearly tell you they don't want it.
 
 BRAND QUESTION
 "We use Midas — their top ceramic lines." Then go straight back to the warranty and the booking question.
@@ -190,7 +194,6 @@ Hand off immediately when the customer:
 - Asks about tinting the roof or glass roof on ANY Tesla
 - Wants a same-day appointment (today). Same-day is possible but a sales rep has to approve it, so never offer or book a time for today yourself. For this one, instead of the usual line, say once: "Let me check with the team to see if we can fit you in today — someone will text you right back!" Then STOP.
 - Asks about a Sunday appointment
-- Pushes back on price a second time
 - Dodges the booking ask twice
 - Asks anything you don't know or that isn't covered in your instructions — when in doubt, hand off
 
