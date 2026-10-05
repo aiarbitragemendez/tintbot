@@ -198,15 +198,33 @@ async function moveOpportunityStage(client, session, stageId, traceId, reasonTag
     console.log(`[${traceId}][STAGE-MOVE-SKIPPED] (${reasonTag}) — no stage id configured for this client`);
     return;
   }
+  // The session can lose (or never get) the opportunity id — server restarts wipe
+  // sessions, and the ad/lead workflow usually creates the opportunity, not the bot.
+  // Look it up in GHL by contact; if the lead has none in this pipeline, create it.
+  if (!session.ghlOpportunityId && client.ghlPipelineId) {
+    try {
+      const contactId = session.ghlContactId || session.contactId;
+      const opportunity = await ghl.addToPipeline(client.ghlApiKey, client.ghlPipelineId, stageId, contactId, {
+        locationId: client.ghlLocationId,
+        name: session.collectedData?.name || undefined,
+      });
+      session.ghlOpportunityId = opportunity?.id || null;
+      if (session.ghlOpportunityId) {
+        console.log(`[${traceId}][STAGE-MOVE] (${reasonTag}) recovered opportunity ${session.ghlOpportunityId} for contact ${contactId}`);
+      }
+    } catch (e) {
+      console.error(`[${traceId}][STAGE-MOVE-FAILED] (${reasonTag}) opportunity lookup/create failed: ${e.message}`);
+    }
+  }
   if (!session.ghlOpportunityId) {
-    console.log(`[${traceId}][STAGE-MOVE-SKIPPED] (${reasonTag}) — no opportunity id on this session`);
+    console.log(`[${traceId}][STAGE-MOVE-SKIPPED] (${reasonTag}) — no opportunity found or created for this contact`);
     return;
   }
   try {
     await ghl.updateOpportunityStage(client.ghlApiKey, session.ghlOpportunityId, stageId);
     console.log(`[${traceId}][STAGE-MOVE] ✅ opportunity ${session.ghlOpportunityId} → ${reasonTag} (${stageId})`);
   } catch (e) {
-    console.error(`[${traceId}][STAGE-MOVE-FAILED] (${reasonTag}) opportunity ${session.ghlOpportunityId}: ${e.message}`);
+    console.error(`[${traceId}][STAGE-MOVE-FAILED] (${reasonTag}) opportunity ${session.ghlOpportunityId}: ${e.message} ${JSON.stringify(e.response?.data || "")}`);
   }
 }
 
