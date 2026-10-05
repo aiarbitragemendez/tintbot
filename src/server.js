@@ -85,6 +85,22 @@ function trace(traceId, stage, msg) {
   console.log(`[${traceId}][${stage}] ${msg}`);
 }
 
+// ─── Reply buffer — wait after the customer's last text before answering ─────
+// Per-client `replyDelaySeconds: { min, max }` (seconds). A random wait in that
+// range, so replies don't land in 5 seconds and a customer who sends several
+// texts in a row gets ONE reply to all of them. 0 / missing = no wait.
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function pickReplyDelayMs(client) {
+  const cfg = client.replyDelaySeconds;
+  if (cfg === undefined || cfg === null) return 0;
+  const min = Number(typeof cfg === "object" ? cfg.min : cfg);
+  const max = Number(typeof cfg === "object" ? cfg.max : cfg);
+  if (!isFinite(min) || !isFinite(max) || max <= 0) return 0;
+  const lo = Math.max(0, Math.min(min, max));
+  const hi = Math.max(min, max);
+  return Math.round((lo + Math.random() * (hi - lo)) * 1000);
+}
+
 // ─── Real availability — open slots filtered to the client's booking window ──
 function getBookingWindow(client) {
   return {
@@ -436,6 +452,31 @@ app.post("/ghl-webhook", async (req, res) => {
     return;
   }
 
+  // ── Reply buffer — wait, and let a newer text from the same contact take over ──
+  // Every inbound bumps the contact's sequence number and joins the "burst".
+  // After the wait, only the handler for the LATEST text carries on; it answers
+  // the whole burst (history is re-fetched from GHL below, after the wait, so it
+  // sees every text). Earlier handlers exit quietly.
+  const mySeq = (session._inboundSeq = (session._inboundSeq || 0) + 1);
+  (session._burstTexts = session._burstTexts || []).push(cleanText);
+  const replyDelayMs = pickReplyDelayMs(client);
+  if (replyDelayMs > 0) {
+    trace(traceId, "2/8 REPLY-BUFFER", `waiting ${(replyDelayMs / 1000).toFixed(1)}s before replying (seq ${mySeq})`);
+    await sleep(replyDelayMs);
+    if (session._inboundSeq !== mySeq) {
+      trace(traceId, "2/8 REPLY-BUFFER", `⛔ skipped: customer sent another text during the wait (seq ${mySeq} → ${session._inboundSeq}) — the newer handler replies to all of them`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=SUPERSEDED_BY_NEWER_TEXT`);
+      return;
+    }
+  }
+  // Everything the customer sent since the bot last answered, oldest first.
+  const burstTexts = session._burstTexts;
+  session._burstTexts = [];
+  const burstText = burstTexts.join("\n");
+  if (burstTexts.length > 1) {
+    trace(traceId, "2/8 REPLY-BUFFER", `answering ${burstTexts.length} texts as one burst`);
+  }
+
   // ── Fetch fresh GHL tags + DND — single source of truth for escalation state ──
   let isBotErrorRetry = false;
   let decision = "PROCEED";
@@ -563,10 +604,10 @@ app.post("/ghl-webhook", async (req, res) => {
 
       // 2. Reschedule/cancel — never attempted by the bot, always a hand-off.
       const RESCHEDULE_CANCEL_RE = /\b(reschedul\w*|cancel\w*|move my appointment|change (my|the) (appointment|time|date)|can'?t make it|need to push|different (day|time)|postpone\w*)\b/i;
-      if (RESCHEDULE_CANCEL_RE.test(cleanText)) {
+      if (RESCHEDULE_CANCEL_RE.test(burstText)) {
         trace(traceId, "5/8 CLAUDE", `📅 [RESCHEDULE-CANCEL] booked contact asked to change/cancel — escalating, not attempting it`);
         await escalateNow(client, session, contactId, outboundType, traceId, "RESCHEDULE-CANCEL",
-          `Booked contact asked to reschedule/cancel. Last message: "${cleanText.slice(0, 200)}"`);
+          `Booked contact asked to reschedule/cancel. Last message: "${burstText.slice(0, 200)}"`);
         trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=RESCHEDULE_CANCEL_ESCALATED`);
         return;
       }
@@ -599,7 +640,7 @@ app.post("/ghl-webhook", async (req, res) => {
   // has pushed back `priceObjectionEscalateAfter` separate times do we intercept and hand
   // off here, deterministically, instead of letting Claude reply again.
   const PRICE_OBJECTION_RE = /\b(too much|too expensive|that'?s a lot|pricey|pricy|can(?:'?t| ?not) afford|lower(?: the)? price|any cheaper|cheaper|discount|price match|better (?:price|deal)|knock (?:it|something) off|come down on (?:the )?price|throw in (?:the )?(?:windshield|something)|do(?:es)? it for less)\b/i;
-  if (client.priceObjectionEscalateAfter && PRICE_OBJECTION_RE.test(cleanText)) {
+  if (client.priceObjectionEscalateAfter && PRICE_OBJECTION_RE.test(burstText)) {
     if (!session._priceObjectionCountedSinceReply) {
       session.priceObjectionCount = (session.priceObjectionCount || 0) + 1;
       session._priceObjectionCountedSinceReply = true;
@@ -680,6 +721,16 @@ app.post("/ghl-webhook", async (req, res) => {
     trace(traceId, "5/8 CLAUDE",
       `Called API with ${contextMessages.length} messages | response=${claudeMs}ms | tokens in=${usage.input_tokens || "?"} out=${usage.output_tokens || "?"}`);
 
+    // ── Another text landed while this reply was being written ────────────
+    // Don't send a reply that ignores it. Hand this burst back so the newer
+    // handler (already waiting out its own buffer) answers everything at once.
+    if (session._inboundSeq !== mySeq) {
+      session._burstTexts = [...burstTexts, ...(session._burstTexts || [])];
+      trace(traceId, "6/8 OUTBOUND", `⛔ skipped: customer texted again while the reply was being written — not sending, the newer handler replies to all of it`);
+      trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=SUPERSEDED_BEFORE_SEND`);
+      return;
+    }
+
     // ── Dedup: don't re-send near-identical reply within 2min ─────────────
     const twoMinAgo = Date.now() - 2 * 60 * 1000;
     const lastBot = [...session.messages].reverse().find(m => m.role === "assistant");
@@ -740,7 +791,7 @@ app.post("/ghl-webhook", async (req, res) => {
     trace(traceId, "7/8 STAFF-NOTIFY", `not needed (normal reply)`);
 
     // Async data extraction and GHL sync
-    syncData(session, client, cleanText, reply, traceId).catch(e =>
+    syncData(session, client, burstText, reply, traceId).catch(e =>
       console.error(`[${traceId}][SYNC] Unhandled error:`, e.message)
     );
     trace(traceId, "8/8 COMPLETE", `Total ${Date.now() - t0}ms | Result=REPLIED`);
