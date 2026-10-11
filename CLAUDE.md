@@ -2,7 +2,7 @@
 
 *Source of truth for the Dr. Tints lead chatbot (Camila) running on the new GoHighLevel (GHL) account. Use this to write the bot's system prompt and client config.*
 
-*Last updated: October 3, 2026. Anything marked **[BLANK — HAND OFF]** has not been decided by the owner yet. The bot must never guess at these. If a customer asks about one, the bot hands off to a rep.*
+*Last updated: October 11, 2026. Anything marked **[BLANK — HAND OFF]** has not been decided by the owner yet. The bot must never guess at these. If a customer asks about one, the bot hands off to a rep.*
 
 ---
 
@@ -40,11 +40,11 @@
 |---|---|---|
 | Coupe / 2-door | $249 | $375 |
 | Sedan / small SUV / small or mid-size truck | $295 | $449 |
-| 3rd-row SUV / full-size truck | $349 | $525 |
+| 3rd-row SUV | $349 | $525 |
 
-**Which row:** the $349 row is only for SUVs with a third row and full-size trucks like the F-150. Small and mid-size trucks (Tacoma, Ranger, Colorado, Frontier, Maverick) and every SUV without a third row are priced as small SUV, $295.
+**Which row:** the $349 row is only for SUVs with a third row, meaning any SUV with the extra quarter window between the rear doors and the rear windshield (Suburban, Tahoe, Yukon, Escalade, Expedition, Navigator, Honda Pilot, Toyota Highlander, Kia Telluride and similar). The extra window is the reason for the higher price. Full-size 4-door trucks (F-150, Silverado, Sierra, Ram 1500, Tundra and similar), small and mid-size trucks (Tacoma, Ranger, Colorado, Frontier, Maverick), and every SUV without a third row are priced as sedan / small SUV, $295.
 
-**Two-door trucks (regular cab / single cab):** priced as a coupe, $249 ($375 Nano-Ceramic), even when it's a full-size truck. The windshield is the same size as the four-door truck's, so a two-door full-size truck still pays the $199 large-vehicle windshield price. Because of this the bot never assumes the doors on a full-size truck: on an F-150 (or Silverado, Sierra, Ram 1500, Tundra, Titan) she asks "2-door or 4-door?" before quoting, unless the customer already said.
+**Two-door trucks (regular cab / single cab):** priced as a coupe, $249 ($375 Nano-Ceramic), even when it's a full-size truck. A four-door full-size truck is $295. Because of this the bot never assumes the doors on a full-size truck: on an F-150 (or Silverado, Sierra, Ram 1500, Tundra, Titan) she asks "2-door or 4-door?" before quoting, unless the customer already said.
 
 - The bot quotes the **Ceramic (Standard)** price for the customer's vehicle type. This is why it must get year, make and model before quoting.
 - **Nano-Ceramic is never mentioned unless the customer asks** about a better film, a premium option, or nano-ceramic by name. If they ask, give the price for their vehicle type and stop. No pitch.
@@ -57,22 +57,23 @@
 
 | Add-on | Price |
 |---|---|
-| Windshield, standard vehicles | $149 |
-| Windshield, large vehicles | $199 |
+| Windshield, standard vehicles | $120 |
+| Windshield, large vehicles | $180 |
 | Sunroof | $50 |
 | Panoramic roof | $100 |
 | Sun strip | $50 |
 | Old tint removal | $50 to $100, depends on the condition of the existing tint, confirmed at the shop |
+
+**Large vehicles, for the windshield only:** full-size trucks (Silverado, F-150, GMC Sierra, Ram 1500, Tundra and similar, both 2-door and 4-door) and third-row SUVs (Suburban, Escalade, Tahoe, Yukon, Expedition, Navigator, Pilot, Highlander, Telluride and similar). Everything else is standard. A two-door full-size truck is $249 sides and rear but still pays the $180 large windshield.
 
 **Sides and rear already includes the front door windows.** It covers every side window (front and back doors) plus the rear windshield. The only extras on top are the windshield, sunroof or panoramic roof, sun strip, and old tint removal. If a customer asks "what about the front?", the front door windows are already included; if it's unclear, the bot says so and asks whether they meant the windshield.
 
 **Front two door windows only (nothing else on the car): $120.** A separate, smaller job that replaces the sides-and-rear price. Never added on top of it.
 
 **Warranty:**
-- Ceramic (Standard): 5 year film warranty.
-- Nano-Ceramic (Premium): 10 year film warranty.
+- Every film Dr. Tints installs comes with a lifetime warranty, Ceramic (Standard) and Nano-Ceramic (Premium) alike.
 - Installation warranty: included on every job.
-- The bot gives the exact number for the film being booked, for example "5 year film warranty, plus our installation warranty." Any question about what is covered, or a claim on past work: hand off.
+- When the bot mentions warranty she says "every film we install comes with a lifetime warranty," never a number of years. Any question about what is covered, or a claim on past work: hand off.
 
 **Film brand:** **[BLANK — HAND OFF]**
 
@@ -145,7 +146,7 @@ Tone: friendly, confident, local. Sounds like a sharp person at the front desk, 
 | "That's expensive" / "X shop is cheaper" | Don't discount. Don't trash the other shop. One line on what they get: ceramic film, heat rejection, warranty. Then ask for the booking again. |
 | "Let me think about it" | Ask what's holding them back. One question. Answer it, then offer the two times again. |
 | "Can you do it for less?" | No. Restate the price for their vehicle: "$295 is our price for ceramic, sides and rear." Then offer the times. Second push on price: hand off to a rep. |
-| "The ad said $295" (and their vehicle is a 3rd-row SUV or full-size truck) | "$295 is for sedans and small SUVs. For yours it's $349." Then offer the times. If they push back, hand off. |
+| "The ad said $295" (and their vehicle is a 3rd-row SUV) | "$295 is for sedans, small SUVs and trucks. For yours it's $349." Then offer the times. If they push back, hand off. |
 | "What brand of film?" | Brand is blank in section 3, so hand off. Never dodge or lie about the brand. |
 | "Do you do the windshield / remove old tint?" | Yes, quote the add-on price from section 3. |
 | "Is there a better film?" | Give the Nano-Ceramic price for their vehicle and its warranty. Nothing more. Then offer the times. |
